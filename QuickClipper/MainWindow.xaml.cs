@@ -61,6 +61,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        LoadWindowIcon();
         _settings = _settingsService.Load();
         _trayIcon = CreateTrayIcon();
         LoadSettingsIntoUi();
@@ -71,6 +72,26 @@ public partial class MainWindow : Window
         SourceInitialized += MainWindow_SourceInitialized;
         SetClipLoaded(false);
         _ = CheckForUpdatesAsync(manual: false);
+    }
+
+    private void LoadWindowIcon()
+    {
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(exePath))
+        {
+            return;
+        }
+
+        using var icon = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+        if (icon is null)
+        {
+            return;
+        }
+
+        Icon = Imaging.CreateBitmapSourceFromHIcon(
+            icon.Handle,
+            Int32Rect.Empty,
+            BitmapSizeOptions.FromEmptyOptions());
     }
 
     public void ExitApplication()

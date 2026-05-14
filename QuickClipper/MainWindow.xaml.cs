@@ -128,7 +128,7 @@ public partial class MainWindow : Window
 
         var icon = new Forms.NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = LoadTrayIcon(),
             Text = "QuickClipper",
             ContextMenuStrip = menu,
             Visible = true
@@ -141,6 +141,21 @@ public partial class MainWindow : Window
             }
         };
         return icon;
+    }
+
+    private static System.Drawing.Icon LoadTrayIcon()
+    {
+        var exePath = Environment.ProcessPath;
+        if (!string.IsNullOrWhiteSpace(exePath))
+        {
+            var icon = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+            if (icon is not null)
+            {
+                return icon;
+            }
+        }
+
+        return System.Drawing.SystemIcons.Application;
     }
 
     private async Task ToggleRecordingAsync()

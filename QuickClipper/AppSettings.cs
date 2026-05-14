@@ -36,6 +36,10 @@ public sealed class AppSettings
 
     public string GitHubRepositoryUrl { get; set; } = DefaultGitHubRepositoryUrl();
 
+    public HotKeyBinding RecordHotKey { get; set; } = HotKeyBinding.DefaultRecord();
+
+    public HotKeyBinding ResetHotKey { get; set; } = HotKeyBinding.DefaultReset();
+
     public string HotKeyLabel { get; set; } = "Win+Shift+R";
 
     private static string DefaultGitHubRepositoryUrl() =>

@@ -7,24 +7,28 @@ public sealed class HotKeyService : IDisposable
 {
     private const int HotKeyId = 0x5143;
     private const int ResetHotKeyId = 0x5144;
-    private const uint ModShift = 0x0004;
-    private const uint ModWin = 0x0008;
-    private const uint VkR = 0x52;
-    private const uint Vk4 = 0x34;
 
     private HwndSource? _source;
     private IntPtr _handle;
+    private bool _hooked;
 
     public event EventHandler? Pressed;
     public event EventHandler? ResetPressed;
 
-    public void Register(IntPtr windowHandle)
+    public void Register(IntPtr windowHandle, HotKeyBinding recordHotKey, HotKeyBinding resetHotKey)
     {
         _handle = windowHandle;
         _source = HwndSource.FromHwnd(windowHandle);
-        _source.AddHook(WndProc);
-        RegisterHotKey(windowHandle, HotKeyId, ModWin | ModShift, VkR);
-        RegisterHotKey(windowHandle, ResetHotKeyId, ModWin | ModShift, Vk4);
+        if (!_hooked)
+        {
+            _source.AddHook(WndProc);
+            _hooked = true;
+        }
+
+        UnregisterHotKey(windowHandle, HotKeyId);
+        UnregisterHotKey(windowHandle, ResetHotKeyId);
+        RegisterOne(windowHandle, HotKeyId, recordHotKey);
+        RegisterOne(windowHandle, ResetHotKeyId, resetHotKey);
     }
 
     public void Dispose()
@@ -35,7 +39,18 @@ public sealed class HotKeyService : IDisposable
             UnregisterHotKey(_handle, ResetHotKeyId);
         }
 
-        _source?.RemoveHook(WndProc);
+        if (_hooked)
+        {
+            _source?.RemoveHook(WndProc);
+        }
+    }
+
+    private static void RegisterOne(IntPtr windowHandle, int id, HotKeyBinding hotKey)
+    {
+        if (!hotKey.IsValid || !RegisterHotKey(windowHandle, id, hotKey.Modifiers, hotKey.Key))
+        {
+            throw new InvalidOperationException($"Could not register hotkey {hotKey.Label}.");
+        }
     }
 
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)

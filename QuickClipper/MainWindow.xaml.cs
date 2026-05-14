@@ -56,6 +56,7 @@ public partial class MainWindow : Window
     private CropDragTarget _cropDragTarget = CropDragTarget.None;
     private System.Windows.Point _cropDragStartPoint;
     private CaptureRegion _cropDragStartRegion;
+    private IntPtr _hotKeyWindowHandle;
 
     public MainWindow()
     {
@@ -88,7 +89,8 @@ public partial class MainWindow : Window
 
     private void MainWindow_SourceInitialized(object? sender, EventArgs e)
     {
-        _hotKey.Register(new WindowInteropHelper(this).Handle);
+        _hotKeyWindowHandle = new WindowInteropHelper(this).Handle;
+        ApplyHotKeys();
         _hotKey.Pressed += async (_, _) => await ToggleRecordingAsync();
         _hotKey.ResetPressed += async (_, _) => await ResetRecordingAsync();
     }
@@ -175,7 +177,7 @@ public partial class MainWindow : Window
         _recordingOverlay.Start();
         RecordButton.IsEnabled = false;
         StopButton.IsEnabled = true;
-        StatusText.Text = "Recording. Win+Shift+R stops. Win+Shift+4 resets.";
+        StatusText.Text = $"Recording. {_settings.RecordHotKey.Label} stops. {_settings.ResetHotKey.Label} resets.";
         SetRecordingUi(true);
     }
 
@@ -733,6 +735,16 @@ public partial class MainWindow : Window
         await CheckForUpdatesAsync(manual: true);
     }
 
+    private void RecordHotKeyText_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        CaptureHotKey(e, hotKey => _settings.RecordHotKey = hotKey, RecordHotKeyText);
+    }
+
+    private void ResetHotKeyText_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        CaptureHotKey(e, hotKey => _settings.ResetHotKey = hotKey, ResetHotKeyText);
+    }
+
     private void TimelineCanvas_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         if (_clipDuration.TotalSeconds <= 0)
@@ -855,6 +867,45 @@ public partial class MainWindow : Window
         _trayIcon.BalloonTipTitle = title;
         _trayIcon.BalloonTipText = message.Length > 180 ? message[..180] : message;
         _trayIcon.ShowBalloonTip(3000);
+    }
+
+    private void CaptureHotKey(System.Windows.Input.KeyEventArgs e, Action<HotKeyBinding> assign, System.Windows.Controls.TextBox textBox)
+    {
+        e.Handled = true;
+        var hotKey = HotKeyBinding.FromKeyEvent(e);
+        if (!hotKey.IsValid)
+        {
+            StatusText.Text = "Use at least one modifier plus a normal key.";
+            return;
+        }
+
+        assign(hotKey);
+        textBox.Text = hotKey.Label;
+        StatusText.Text = "Hotkey captured. Save settings to apply.";
+    }
+
+    private void ApplyHotKeys()
+    {
+        if (_hotKeyWindowHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        if (_settings.RecordHotKey.SameAs(_settings.ResetHotKey))
+        {
+            StatusText.Text = "Record and reset hotkeys must be different.";
+            return;
+        }
+
+        try
+        {
+            _hotKey.Register(_hotKeyWindowHandle, _settings.RecordHotKey, _settings.ResetHotKey);
+            StatusText.Text = $"{_settings.RecordHotKey.Label} to select an area.";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = ShortError(ex.Message);
+        }
     }
 
     private async Task CheckForUpdatesAsync(bool manual)
@@ -1529,6 +1580,8 @@ public partial class MainWindow : Window
         _settings.StartWithWindows = _startupService.IsEnabled();
         StartWithWindowsCheckBox.IsChecked = _settings.StartWithWindows;
         UpdateRepositoryUrlText.Text = _settings.GitHubRepositoryUrl;
+        RecordHotKeyText.Text = _settings.RecordHotKey.Label;
+        ResetHotKeyText.Text = _settings.ResetHotKey.Label;
         _isLoadingSettings = false;
     }
 
@@ -1551,6 +1604,7 @@ public partial class MainWindow : Window
         _settings.GitHubRepositoryUrl = UpdateRepositoryUrlText.Text.Trim();
         _startupService.SetEnabled(_settings.StartWithWindows);
         _settingsService.Save(_settings);
+        ApplyHotKeys();
         UpdateSettingsSummary();
     }
 
@@ -1748,7 +1802,7 @@ public partial class MainWindow : Window
         }
 
         CurrentSettingsText.Text =
-            $"Current: {_settings.FrameRate} FPS, max {_settings.MaxMegabytes:0.##} MB, quality cap {(_settings.QualityLengthCapEnabled ? "on" : "off")}, encoder {_settings.ExportEncoderKey}, audio {(_settings.IncludeAudio ? "on" : "off")}, startup {(_settings.StartWithWindows ? "on" : "off")}, updates {(string.IsNullOrWhiteSpace(_settings.GitHubRepositoryUrl) ? "off" : "on")}, save to {_settings.SaveFolder}";
+            $"Current: {_settings.FrameRate} FPS, max {_settings.MaxMegabytes:0.##} MB, quality cap {(_settings.QualityLengthCapEnabled ? "on" : "off")}, encoder {_settings.ExportEncoderKey}, audio {(_settings.IncludeAudio ? "on" : "off")}, startup {(_settings.StartWithWindows ? "on" : "off")}, updates {(string.IsNullOrWhiteSpace(_settings.GitHubRepositoryUrl) ? "off" : "on")}, hotkeys {_settings.RecordHotKey.Label}/{_settings.ResetHotKey.Label}, save to {_settings.SaveFolder}";
         UpdateQualityBudgetText();
     }
 

@@ -310,6 +310,19 @@
 
                     <Button Content="Save Settings" Height="32" Margin="0,0,0,18" Click="SaveSettings_Click" />
 
+                    <TextBlock Text="Options" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,12" />
+                    <Border BorderBrush="#E2E8F0" BorderThickness="0,1,0,0" Margin="0,0,0,14" />
+                    <TextBlock Text="Record hotkey" Style="{StaticResource FieldLabel}" />
+                    <TextBox x:Name="RecordHotKeyText"
+                             Margin="0,4,0,10"
+                             IsReadOnly="True"
+                             PreviewKeyDown="RecordHotKeyText_PreviewKeyDown" />
+                    <TextBlock Text="Reset hotkey" Style="{StaticResource FieldLabel}" />
+                    <TextBox x:Name="ResetHotKeyText"
+                             Margin="0,4,0,18"
+                             IsReadOnly="True"
+                             PreviewKeyDown="ResetHotKeyText_PreviewKeyDown" />
+
                     <TextBlock Text="Crop" Style="{StaticResource SectionTitle}" />
                     <UniformGrid Columns="2" Margin="0,0,0,12">
                         <StackPanel Margin="0,0,8,8">

@@ -8,7 +8,9 @@ Run:
 dotnet run --project .\QuickClipper\QuickClipper.csproj
 ```
 
-Use `Ctrl+Shift+R` to select a screen region, then press it again to stop recording. After recording, trim the clip, adjust crop/resize values, export to the configured folder, and use `Copy File` to place the exported file on the clipboard.
+Use `Win+Shift+R` to select a screen region, then press it again to stop recording. Use `Win+Shift+4` to reset the current recording. After recording, trim the clip, adjust crop/resize values, export to the configured folder, and use `Copy File` to place the exported file on the clipboard.
+
+Hotkeys can be changed in the Options section of the app settings.
 
 Requires `ffmpeg.exe`. Either put FFmpeg on `PATH` or set the path in the app settings.
 

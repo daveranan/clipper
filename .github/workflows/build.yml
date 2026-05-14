@@ -1,0 +1,26 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore .\QuickClipper\QuickClipper.csproj
+
+      - name: Build
+        run: dotnet build .\QuickClipper\QuickClipper.csproj -c Release --no-restore

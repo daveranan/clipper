@@ -7,6 +7,7 @@ public sealed class UpdateService
 {
     public async Task<UpdateCheckResult> CheckDownloadAndRestartAsync(
         string repositoryUrl,
+        Func<string, Task<bool>>? confirmInstall = null,
         Action<int>? progress = null,
         CancellationToken cancellationToken = default)
     {
@@ -23,6 +24,11 @@ public sealed class UpdateService
 
         if (manager.UpdatePendingRestart is not null)
         {
+            if (confirmInstall is not null && !await confirmInstall("A downloaded update is ready. Restart and apply it now?"))
+            {
+                return UpdateCheckResult.NoUpdate("Update is ready to apply later.");
+            }
+
             manager.ApplyUpdatesAndRestart(manager.UpdatePendingRestart);
             return UpdateCheckResult.Restarting("Applying downloaded update.");
         }
@@ -31,6 +37,12 @@ public sealed class UpdateService
         if (update is null)
         {
             return UpdateCheckResult.NoUpdate("Already up to date.");
+        }
+
+        var version = update.TargetFullRelease.Version.ToString();
+        if (confirmInstall is not null && !await confirmInstall($"QuickClipper {version} is available. Download and restart now?"))
+        {
+            return UpdateCheckResult.NoUpdate($"Update {version} skipped.");
         }
 
         await manager.DownloadUpdatesAsync(update, progress, cancellationToken);

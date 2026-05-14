@@ -874,6 +874,8 @@ public partial class MainWindow : Window
 
             var result = await _updateService.CheckDownloadAndRestartAsync(
                 _settings.GitHubRepositoryUrl,
+                message => Dispatcher.InvokeAsync(() =>
+                    System.Windows.MessageBox.Show(message, "QuickClipper update", MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes).Task,
                 progress => Dispatcher.Invoke(() => StatusText.Text = $"Downloading update {progress}%..."));
 
             if (manual || result.Kind == UpdateCheckResultKind.Restarting)

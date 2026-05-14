@@ -2,6 +2,7 @@ bin/
 obj/
 publish/
 Releases/
+.tmp-tools/
 .vs/
 *.user
 *.suo

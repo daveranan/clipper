@@ -15,10 +15,11 @@ Requires `ffmpeg.exe`. Either put FFmpeg on `PATH` or set the path in the app se
 Release/update flow:
 
 ```powershell
+git push origin master
 git tag v0.1.0
 git push origin master --tags
 ```
 
-GitHub Actions builds the tag, packages it with Velopack, and publishes a GitHub Release with `QuickClipperSetup.exe` plus update feed files. In QuickClipper settings, set `GitHub repo URL` to your repo URL, for example `https://github.com/OWNER/REPO`; installed Velopack builds check that release feed on startup and from the tray `Check for Updates` item.
+GitHub Actions builds `master` as a validation check. Tags named `v*` package the app with Velopack and publish a GitHub Release with `QuickClipperSetup.exe` plus update feed files.
 
-The workflow only creates releases from `v*` tags. The first install must come from the GitHub Release setup exe; auto-update is not active when running from `dotnet run` or `bin`.
+The release build embeds `https://github.com/daveranan/clipper` as the update source. The first install must come from the GitHub Release setup exe; auto-update is not active when running from `dotnet run` or `bin`.

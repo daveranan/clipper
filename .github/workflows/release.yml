@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = if ($tag -match '^v(?<v>\d+\.\d+\.\d+.*)$') { $Matches.v } else { "0.0.${{ github.run_number }}" }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Publish app
+        shell: pwsh
+        run: |
+          dotnet publish .\QuickClipper\QuickClipper.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:Version=${{ steps.version.outputs.value }} `
+            -p:GitHubRepositoryUrl=https://github.com/${{ github.repository }} `
+            -p:PublishSingleFile=false `
+            -o .\publish
+
+      - name: Install Velopack CLI
+        shell: pwsh
+        run: dotnet tool install -g vpk --version 0.0.1298
+
+      - name: Download previous release
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package and upload release
+        shell: pwsh
+        run: |
+          vpk pack --packId QuickClipper --packVersion ${{ steps.version.outputs.value }} --packDir .\publish --mainExe QuickClipper.exe --packTitle QuickClipper
+          vpk upload github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --publish --releaseName "QuickClipper ${{ steps.version.outputs.value }}" --tag v${{ steps.version.outputs.value }}

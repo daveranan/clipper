@@ -1,0 +1,41 @@
+<Window x:Class="QuickClipper.BenchmarkReportWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Encoder Benchmark"
+        Height="640"
+        Width="980"
+        WindowStartupLocation="CenterOwner">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="2*" />
+            <RowDefinition Height="3*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock x:Name="SummaryText" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12" TextWrapping="Wrap" />
+
+        <Border Grid.Row="1" BorderBrush="#CCC" BorderThickness="1" Background="#111" Margin="0,0,0,12">
+            <Image x:Name="FramePreviewImage" Stretch="Uniform" />
+        </Border>
+
+        <DataGrid x:Name="ResultsGrid"
+                  Grid.Row="2"
+                  AutoGenerateColumns="False"
+                  IsReadOnly="True"
+                  CanUserAddRows="False"
+                  SelectionChanged="ResultsGrid_SelectionChanged">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Encoder" Binding="{Binding Encoder}" Width="*" />
+                <DataGridTextColumn Header="Size" Binding="{Binding Size}" Width="90" />
+                <DataGridTextColumn Header="Video" Binding="{Binding VideoBitrate}" Width="90" />
+                <DataGridTextColumn Header="Audio" Binding="{Binding AudioBitrate}" Width="80" />
+                <DataGridTextColumn Header="Total" Binding="{Binding TotalBitrate}" Width="90" />
+                <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="90" />
+                <DataGridTextColumn Header="Speed" Binding="{Binding Speed}" Width="120" />
+            </DataGrid.Columns>
+        </DataGrid>
+
+        <Button Grid.Row="3" Content="Close" Width="96" Height="32" Margin="0,12,0,0" HorizontalAlignment="Right" Click="Close_Click" />
+    </Grid>
+</Window>

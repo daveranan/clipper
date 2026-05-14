@@ -33,10 +33,15 @@ public sealed class HotKeyBinding
 
         return new HotKeyBinding
         {
-            Modifiers = ToHotKeyModifiers(Keyboard.Modifiers),
+            Modifiers = ToHotKeyModifiers(Keyboard.Modifiers) | CurrentWindowsModifier(),
             Key = (uint)KeyInterop.VirtualKeyFromKey(key)
         };
     }
+
+    private static uint CurrentWindowsModifier() =>
+        Keyboard.IsKeyDown(System.Windows.Input.Key.LWin) || Keyboard.IsKeyDown(System.Windows.Input.Key.RWin)
+            ? ModWin
+            : 0;
 
     private static uint ToHotKeyModifiers(ModifierKeys modifiers)
     {

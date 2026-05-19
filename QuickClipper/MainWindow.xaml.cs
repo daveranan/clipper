@@ -1615,7 +1615,6 @@ public partial class MainWindow : Window
         SelectEncoder(_settings.ExportEncoderKey);
         _settings.StartWithWindows = _startupService.IsEnabled();
         StartWithWindowsCheckBox.IsChecked = _settings.StartWithWindows;
-        UpdateRepositoryUrlText.Text = _settings.GitHubRepositoryUrl;
         RecordHotKeyText.Text = _settings.RecordHotKey.Label;
         ResetHotKeyText.Text = _settings.ResetHotKey.Label;
         _isLoadingSettings = false;
@@ -1637,7 +1636,6 @@ public partial class MainWindow : Window
         _settings.ExportEncoderKey = GetSelectedEncoderKey();
         _settings.AudioDeviceName = "Desktop audio";
         _settings.StartWithWindows = StartWithWindowsCheckBox.IsChecked == true;
-        _settings.GitHubRepositoryUrl = UpdateRepositoryUrlText.Text.Trim();
         _startupService.SetEnabled(_settings.StartWithWindows);
         _settingsService.Save(_settings);
         ApplyHotKeys();

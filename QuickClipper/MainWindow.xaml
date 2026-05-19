@@ -277,11 +277,10 @@
                               Margin="0,0,0,8"
                               Checked="StartupSetting_Changed"
                               Unchecked="StartupSetting_Changed" />
-                    <TextBlock Text="GitHub repo URL" Style="{StaticResource FieldLabel}" />
-                    <DockPanel Margin="0,4,0,10" LastChildFill="True">
-                        <Button Content="Check" Width="58" DockPanel.Dock="Right" Click="CheckUpdatesButton_Click" />
-                        <TextBox x:Name="UpdateRepositoryUrlText" Margin="0,0,6,0" />
-                    </DockPanel>
+                    <Button Content="Check for Updates"
+                            Height="30"
+                            Margin="0,0,0,10"
+                            Click="CheckUpdatesButton_Click" />
                     <TextBlock Text="Captures desktop audio from the default Windows output."
                                Style="{StaticResource MutedText}"
                                Margin="0,0,0,10" />

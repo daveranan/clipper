@@ -713,8 +713,8 @@ function MainApp() {
 
   const startRecordingWithRegion = async (region: Omit<RecordingRequest, 'settings'>) => {
     const normalized = {
-      x: Math.max(0, Math.round(region.x)),
-      y: Math.max(0, Math.round(region.y)),
+      x: Math.round(region.x),
+      y: Math.round(region.y),
       width: makeEven(Math.max(8, region.width)),
       height: makeEven(Math.max(8, region.height)),
     }

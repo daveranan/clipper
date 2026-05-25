@@ -191,8 +191,8 @@ pub struct BenchmarkResult {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingRequest {
-    x: u32,
-    y: u32,
+    x: i32,
+    y: i32,
     width: u32,
     height: u32,
     settings: AppSettings,
@@ -201,8 +201,8 @@ pub struct RecordingRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingRegion {
-    x: u32,
-    y: u32,
+    x: i32,
+    y: i32,
     width: u32,
     height: u32,
 }
@@ -465,79 +465,81 @@ fn list_audio_devices(settings: AppSettings) -> Result<Vec<String>, String> {
 #[tauri::command]
 fn open_region_selector() -> Result<Option<RecordingRegion>, String> {
     let script = r#"
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName WindowsBase
-$bounds = @{
-  X = [System.Windows.SystemParameters]::VirtualScreenLeft
-  Y = [System.Windows.SystemParameters]::VirtualScreenTop
-  Width = [System.Windows.SystemParameters]::VirtualScreenWidth
-  Height = [System.Windows.SystemParameters]::VirtualScreenHeight
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NativeDpi {
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 }
+'@
+try { [NativeDpi]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null } catch { try { [NativeDpi]::SetProcessDPIAware() | Out-Null } catch {} }
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $script:start = $null
+$script:current = $null
 $script:result = $null
-$window = New-Object System.Windows.Window
-$window.WindowStyle = [System.Windows.WindowStyle]::None
-$window.ResizeMode = [System.Windows.ResizeMode]::NoResize
-$window.AllowsTransparency = $true
-$window.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(0x88,0,0,0))
-$window.Topmost = $true
-$window.ShowInTaskbar = $false
-$window.Cursor = [System.Windows.Input.Cursors]::Cross
-$window.Left = $bounds.X
-$window.Top = $bounds.Y
-$window.Width = $bounds.Width
-$window.Height = $bounds.Height
-$window.Focusable = $true
-$canvas = New-Object System.Windows.Controls.Canvas
-$canvas.Background = [System.Windows.Media.Brushes]::Transparent
-$rect = New-Object System.Windows.Shapes.Rectangle
-$rect.Stroke = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x41,0xD6,0xC3))
-$rect.StrokeThickness = 2
-$rect.Fill = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(0x22,0x41,0xD6,0xC3))
-$rect.Visibility = [System.Windows.Visibility]::Collapsed
-$canvas.Children.Add($rect) | Out-Null
-$window.Content = $canvas
-$window.Add_KeyDown({ if ($_.Key -eq [System.Windows.Input.Key]::Escape) { $script:result = 'cancel'; $window.Close() } })
-$canvas.Add_MouseRightButtonDown({ $script:result = 'cancel'; $window.Close() })
-$canvas.Add_MouseLeftButtonDown({
-  $script:start = $_.GetPosition($canvas)
-  $rect.Visibility = [System.Windows.Visibility]::Visible
-  [System.Windows.Controls.Canvas]::SetLeft($rect, $script:start.X)
-  [System.Windows.Controls.Canvas]::SetTop($rect, $script:start.Y)
-  $rect.Width = 0
-  $rect.Height = 0
-  $canvas.CaptureMouse() | Out-Null
+$form = New-Object System.Windows.Forms.Form
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$form.Bounds = $bounds
+$form.TopMost = $true
+$form.ShowInTaskbar = $false
+$form.BackColor = [System.Drawing.Color]::Black
+$form.Opacity = 0.35
+$form.Cursor = [System.Windows.Forms.Cursors]::Cross
+$form.KeyPreview = $true
+$form.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $script:result = 'cancel'; $form.Close() } })
+$form.Add_MouseDown({
+  if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
+    $script:result = 'cancel'
+    $form.Close()
+    return
+  }
+  if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+  $script:start = New-Object System.Drawing.Point -ArgumentList ($_.X + $bounds.Left), ($_.Y + $bounds.Top)
+  $script:current = $script:start
+  $form.Invalidate()
 })
-$canvas.Add_MouseMove({
+$form.Add_MouseMove({
   if ($script:start -eq $null) { return }
-  $pos = $_.GetPosition($canvas)
-  $left = [Math]::Min($script:start.X, $pos.X)
-  $top = [Math]::Min($script:start.Y, $pos.Y)
-  $width = [Math]::Abs($pos.X - $script:start.X)
-  $height = [Math]::Abs($pos.Y - $script:start.Y)
-  [System.Windows.Controls.Canvas]::SetLeft($rect, $left)
-  [System.Windows.Controls.Canvas]::SetTop($rect, $top)
-  $rect.Width = $width
-  $rect.Height = $height
+  $script:current = New-Object System.Drawing.Point -ArgumentList ($_.X + $bounds.Left), ($_.Y + $bounds.Top)
+  $form.Invalidate()
 })
-$canvas.Add_MouseLeftButtonUp({
+$form.Add_MouseUp({
   if ($script:start -eq $null) { return }
-  $pos = $_.GetPosition($canvas)
-  $canvas.ReleaseMouseCapture()
-  $x = [Math]::Round([Math]::Min($script:start.X, $pos.X) + $window.Left)
-  $y = [Math]::Round([Math]::Min($script:start.Y, $pos.Y) + $window.Top)
-  $w = [Math]::Round([Math]::Abs($pos.X - $script:start.X))
-  $h = [Math]::Round([Math]::Abs($pos.Y - $script:start.Y))
+  if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+  $end = New-Object System.Drawing.Point -ArgumentList ($_.X + $bounds.Left), ($_.Y + $bounds.Top)
+  $x = [Math]::Min($script:start.X, $end.X)
+  $y = [Math]::Min($script:start.Y, $end.Y)
+  $w = [Math]::Abs($end.X - $script:start.X)
+  $h = [Math]::Abs($end.Y - $script:start.Y)
   if ($w -ge 8 -and $h -ge 8) {
     $script:result = @{ x = $x; y = $y; width = $w; height = $h } | ConvertTo-Json -Compress
   } else {
     $script:result = 'cancel'
   }
-  $window.Close()
+  $form.Close()
 })
-$window.Add_Loaded({ $window.Activate(); $window.Focus() | Out-Null })
-[void]$window.ShowDialog()
+$form.Add_Paint({
+  if ($script:start -eq $null -or $script:current -eq $null) { return }
+  $left = [Math]::Min($script:start.X, $script:current.X) - $bounds.Left
+  $top = [Math]::Min($script:start.Y, $script:current.Y) - $bounds.Top
+  $width = [Math]::Abs($script:current.X - $script:start.X)
+  $height = [Math]::Abs($script:current.Y - $script:start.Y)
+  if ($width -le 0 -or $height -le 0) { return }
+  $selection = New-Object System.Drawing.Rectangle -ArgumentList $left, $top, $width, $height
+  $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(70, 65, 214, 195))
+  $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 65, 214, 195), 2)
+  $_.Graphics.FillRectangle($brush, $selection)
+  $_.Graphics.DrawRectangle($pen, $selection)
+  $brush.Dispose()
+  $pen.Dispose()
+})
+$form.Add_Shown({ $form.Activate(); $form.Focus() })
+[void]$form.ShowDialog()
 if ($script:result -and $script:result -ne 'cancel') { Write-Output $script:result }
 "#;
 
@@ -1265,66 +1267,69 @@ fn mux_recording_audio(ffmpeg_path: &str, video_path: &Path, audio_path: &Path) 
     Ok(())
 }
 
-fn start_recording_overlay(x: u32, y: u32, width: u32, height: u32) -> Result<Child, String> {
+fn start_recording_overlay(x: i32, y: i32, width: u32, height: u32) -> Result<Child, String> {
     let script = r#"
 $X = __X__
 $Y = __Y__
 $W = __W__
 $H = __H__
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName WindowsBase
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public static class NativeWindowStyles {
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
   [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 }
 '@
-$window = New-Object System.Windows.Window
-$window.WindowStyle = [System.Windows.WindowStyle]::None
-$window.ResizeMode = [System.Windows.ResizeMode]::NoResize
-$window.AllowsTransparency = $true
-$window.Background = [System.Windows.Media.Brushes]::Transparent
-$window.Topmost = $true
+try { [NativeWindowStyles]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null } catch { try { [NativeWindowStyles]::SetProcessDPIAware() | Out-Null } catch {} }
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$transparent = [System.Drawing.Color]::FromArgb(255, 255, 0, 255)
+$record = [System.Drawing.Color]::FromArgb(229, 72, 77)
+$window = New-Object System.Windows.Forms.Form
+$window.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$window.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$window.Bounds = New-Object System.Drawing.Rectangle -ArgumentList ($X - 3), ($Y - 36), ($W + 6), ($H + 42)
+$window.TopMost = $true
 $window.ShowInTaskbar = $false
-$window.Left = $X - 3
-$window.Top = $Y - 36
-$window.Width = $W + 6
-$window.Height = $H + 42
-$canvas = New-Object System.Windows.Controls.Canvas
-$timerText = New-Object System.Windows.Controls.TextBlock
+$window.BackColor = $transparent
+$window.TransparencyKey = $transparent
+$timerText = New-Object System.Windows.Forms.Label
 $timerText.Text = '00:00'
-$timerText.Padding = New-Object System.Windows.Thickness 8,4,8,4
-$timerText.Background = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromArgb(0xCC,0x11,0x11,0x11))
-$timerText.Foreground = [System.Windows.Media.Brushes]::White
-$timerText.FontWeight = [System.Windows.FontWeights]::SemiBold
-[System.Windows.Controls.Canvas]::SetLeft($timerText,0)
-[System.Windows.Controls.Canvas]::SetTop($timerText,0)
-$border = New-Object System.Windows.Controls.Border
-$border.BorderBrush = New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xE5,0x48,0x4D))
-$border.BorderThickness = New-Object System.Windows.Thickness 3
-$border.Width = $W + 6
-$border.Height = $H + 6
-[System.Windows.Controls.Canvas]::SetLeft($border,0)
-[System.Windows.Controls.Canvas]::SetTop($border,33)
-$canvas.Children.Add($timerText) | Out-Null
-$canvas.Children.Add($border) | Out-Null
-$window.Content = $canvas
+$timerText.AutoSize = $true
+$timerText.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 8, 4, 8, 4
+$timerText.BackColor = [System.Drawing.Color]::FromArgb(204, 17, 17, 17)
+$timerText.ForeColor = [System.Drawing.Color]::White
+$timerText.Font = New-Object System.Drawing.Font -ArgumentList $timerText.Font, ([System.Drawing.FontStyle]::Bold)
+$timerText.Location = New-Object System.Drawing.Point -ArgumentList 0, 0
+$window.Controls.Add($timerText)
+foreach ($panel in @(
+  @{ X = 0; Y = 33; W = $W + 6; H = 3 },
+  @{ X = 0; Y = 33; W = 3; H = $H + 6 },
+  @{ X = $W + 3; Y = 33; W = 3; H = $H + 6 },
+  @{ X = 0; Y = $H + 36; W = $W + 6; H = 3 }
+)) {
+  $edge = New-Object System.Windows.Forms.Panel
+  $edge.BackColor = $record
+  $edge.Bounds = New-Object System.Drawing.Rectangle -ArgumentList $panel.X, $panel.Y, $panel.W, $panel.H
+  $window.Controls.Add($edge)
+}
 $started = [DateTime]::Now
-$timer = New-Object System.Windows.Threading.DispatcherTimer
-$timer.Interval = [TimeSpan]::FromMilliseconds(250)
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 250
 $timer.Add_Tick({
   $elapsed = [DateTime]::Now - $started
   if ($elapsed.TotalHours -ge 1) { $timerText.Text = $elapsed.ToString('hh\:mm\:ss') } else { $timerText.Text = $elapsed.ToString('mm\:ss') }
 })
-$window.Add_SourceInitialized({
-  $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($window)).Handle
+$window.Add_Shown({
+  $hwnd = $window.Handle
   $style = [NativeWindowStyles]::GetWindowLong($hwnd, -20)
   [NativeWindowStyles]::SetWindowLong($hwnd, -20, $style -bor 0x20 -bor 0x80000) | Out-Null
+  $timer.Start()
 })
-$window.Add_Loaded({ $timer.Start() })
 $window.Add_Closed({ $timer.Stop() })
 [void]$window.ShowDialog()
 "#

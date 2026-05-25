@@ -7,20 +7,29 @@ on:
   pull_request:
 
 jobs:
-  windows:
+  tauri:
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          dotnet-version: "8.0.x"
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
 
-      - name: Restore
-        run: dotnet restore .\QuickClipper\QuickClipper.csproj
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
-        run: dotnet build .\QuickClipper\QuickClipper.csproj -c Release --no-restore
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Tauri backend
+        working-directory: src-tauri
+        run: cargo check

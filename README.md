@@ -1,27 +1,51 @@
 # QuickClipper
 
-Native Windows tray app for quick screen snippets.
+QuickClipper is now a Tauri + React desktop clip editor. The old WPF app has been removed from the repo; the Tauri app at the repository root is the default build, release, and update target.
 
-Run:
-
-```powershell
-dotnet run --project .\QuickClipper\QuickClipper.csproj
-```
-
-Use `Win+Shift+R` to select a screen region, then press it again to stop recording. Use `Win+Shift+4` to reset the current recording. After recording, trim the clip, adjust crop/resize values, export to the configured folder, and use `Copy File` to place the exported file on the clipboard.
-
-Hotkeys can be changed in the Options section of the app settings.
-
-Requires `ffmpeg.exe`. Either put FFmpeg on `PATH` or set the path in the app settings.
-
-Release/update flow:
+## Local development
 
 ```powershell
-git push origin master
-git tag v0.1.0
-git push origin master --tags
+npm ci
+npm run tauri dev
 ```
 
-GitHub Actions builds `master` as a validation check. Tags named `v*` package the app with Velopack and publish a GitHub Release with `QuickClipperSetup.exe` plus update feed files.
+## Build
 
-The release build embeds `https://github.com/daveranan/clipper` as the update source. The first install must come from the GitHub Release setup exe; auto-update is not active when running from `dotnet run` or `bin`.
+```powershell
+npm run build
+npm run tauri build
+```
+
+Installer output:
+
+```text
+src-tauri\target\release\bundle\nsis\QuickClipper_0.1.0_x64-setup.exe
+src-tauri\target\release\bundle\msi\QuickClipper_0.1.0_x64_en-US.msi
+```
+
+Desktop helper shortcut:
+
+```text
+C:\Users\David\Desktop\Build Install Launch QuickClipper.lnk
+```
+
+The shortcut runs `scripts\BuildInstallLaunch.ps1`, builds the Tauri app, writes `latest.json`, opens the bundle folder, runs the installer, and launches QuickClipper.
+
+## GitHub releases and updates
+
+The release workflow builds signed Tauri installers and publishes updater artifacts to GitHub Releases. Configure these GitHub secrets:
+
+```powershell
+TAURI_SIGNING_PRIVATE_KEY
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+```
+
+Create a tag like `v0.1.0` or run the `Release` workflow manually. The workflow uploads NSIS/MSI installers, signatures, and `latest.json`.
+
+Existing Tauri installs can auto-update from:
+
+```text
+https://github.com/daveranan/clipper/releases/latest/download/latest.json
+```
+
+Existing WPF/Velopack installs will not auto-update from Tauri's `latest.json`. Those users need a one-time WPF/Velopack bridge release that launches the new Tauri installer, or they need to install the new Tauri build manually once.

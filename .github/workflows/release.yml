@@ -10,19 +10,22 @@ permissions:
   contents: write
 
 jobs:
-  windows:
+  tauri:
     runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          dotnet-version: |
-            8.0.x
-            9.0.x
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Resolve version
         id: version
@@ -32,30 +35,43 @@ jobs:
           $version = if ($tag -match '^v(?<v>\d+\.\d+\.\d+.*)$') { $Matches.v } else { "0.0.${{ github.run_number }}" }
           "value=$version" >> $env:GITHUB_OUTPUT
 
-      - name: Publish app
+      - name: Stamp version
         shell: pwsh
         run: |
-          dotnet publish .\QuickClipper\QuickClipper.csproj `
-            -c Release `
-            -r win-x64 `
-            --self-contained true `
-            -p:Version=${{ steps.version.outputs.value }} `
-            -p:GitHubRepositoryUrl=https://github.com/${{ github.repository }} `
-            -p:PublishSingleFile=false `
-            -o .\publish
+          $pkgPath = "package.json"
+          $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
+          $pkg.version = "${{ steps.version.outputs.value }}"
+          $pkg | ConvertTo-Json -Depth 20 | Set-Content $pkgPath
 
-      - name: Install Velopack CLI
-        shell: pwsh
-        run: dotnet tool install -g vpk --version 0.0.1298
+          $tauriPath = "src-tauri/tauri.conf.json"
+          $tauri = Get-Content $tauriPath -Raw | ConvertFrom-Json
+          $tauri.version = "${{ steps.version.outputs.value }}"
+          $tauri | ConvertTo-Json -Depth 20 | Set-Content $tauriPath
 
-      - name: Download previous release
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build signed app and updater artifacts
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build
+
+      - name: Create updater manifest
         shell: pwsh
-        continue-on-error: true
         run: |
-          vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }}
+          .\scripts\CreateLatestJson.ps1 `
+            -Version "${{ steps.version.outputs.value }}" `
+            -Repository "${{ github.repository }}"
 
-      - name: Package and upload release
-        shell: pwsh
-        run: |
-          vpk pack --packId QuickClipper --packVersion ${{ steps.version.outputs.value }} --packDir .\publish --mainExe QuickClipper.exe --packTitle QuickClipper
-          vpk upload github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --publish --releaseName "QuickClipper ${{ steps.version.outputs.value }}" --tag v${{ steps.version.outputs.value }}
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: QuickClipper ${{ steps.version.outputs.value }}
+          tag_name: v${{ steps.version.outputs.value }}
+          files: |
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.zip
+            src-tauri/target/release/bundle/**/*.sig
+            src-tauri/target/release/bundle/latest.json

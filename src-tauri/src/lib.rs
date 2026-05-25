@@ -1,5 +1,7 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
@@ -12,8 +14,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -45,7 +45,8 @@ pub struct AppSettings {
     ffmpeg_path: String,
     frame_rate: u32,
     max_megabytes: f64,
-    quality_length_cap_enabled: bool,
+    #[serde(default = "default_true")]
+    size_cap_enabled: bool,
     quality_target_kbps: u32,
     export_encoder_key: String,
     export_bitrate_scale: f64,
@@ -73,7 +74,7 @@ impl Default for AppSettings {
             ffmpeg_path: "ffmpeg".to_string(),
             frame_rate: 30,
             max_megabytes: 9.8,
-            quality_length_cap_enabled: true,
+            size_cap_enabled: true,
             quality_target_kbps: 10000,
             export_encoder_key: "x264-medium".to_string(),
             export_bitrate_scale: 1.0,
@@ -88,6 +89,10 @@ impl Default for AppSettings {
             github_repository_url: "https://github.com/daveranan/clipper".to_string(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +193,12 @@ pub struct BenchmarkResult {
     error: String,
 }
 
+struct ExportAttemptResult {
+    path: PathBuf,
+    bytes: u64,
+    kbps: u32,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingRequest {
@@ -229,7 +240,10 @@ fn save_settings(settings: AppSettings) -> Result<(), String> {
 #[tauri::command]
 fn open_video_dialog(settings: AppSettings) -> Result<Option<VideoInfo>, String> {
     let Some(source_path) = rfd::FileDialog::new()
-        .add_filter("Video", &["mp4", "mov", "mkv", "webm", "avi", "wmv", "m4v", "gif"])
+        .add_filter(
+            "Video",
+            &["mp4", "mov", "mkv", "webm", "avi", "wmv", "m4v", "gif"],
+        )
         .pick_file()
     else {
         return Ok(None);
@@ -240,7 +254,12 @@ fn open_video_dialog(settings: AppSettings) -> Result<Option<VideoInfo>, String>
 }
 
 #[tauri::command]
-fn prepare_preview_cache(input_path: String, fps: u32, max_seconds: f64, settings: AppSettings) -> Result<PreviewCache, String> {
+fn prepare_preview_cache(
+    input_path: String,
+    fps: u32,
+    max_seconds: f64,
+    settings: AppSettings,
+) -> Result<PreviewCache, String> {
     let folder = preview_root()?.join(Uuid::new_v4().to_string());
     fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
     let pattern = folder.join("frame_%06d.jpg");
@@ -319,39 +338,88 @@ fn prepare_playback_source(input_path: String, settings: AppSettings) -> Result<
 }
 
 #[tauri::command]
-fn extract_exact_frame(input_path: String, seconds_at: f64, settings: AppSettings) -> Result<String, String> {
+fn extract_exact_frame(
+    input_path: String,
+    seconds_at: f64,
+    settings: AppSettings,
+) -> Result<String, String> {
+    let probe = probe_video_file(&settings, Path::new(&input_path), Path::new(&input_path))?
+        .ok_or_else(|| "Could not read media duration.".to_string())?;
+    let safe_seconds = seconds_at
+        .max(0.0)
+        .min((probe.duration_seconds - 0.05).max(0.0));
     let folder = preview_root()?.join("exact");
     fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
-    let frame_path = folder.join(format!("frame-{}-{}.jpg", Uuid::new_v4(), millis(seconds_at)));
-    run_command(
+    let frame_path = folder.join(format!(
+        "frame-{}-{}.jpg",
+        Uuid::new_v4(),
+        millis(safe_seconds)
+    ));
+    let first = run_command(
         &settings.ffmpeg_path,
         &[
             "-hide_banner",
             "-y",
+            "-ss",
+            &seconds(safe_seconds),
             "-i",
             &input_path,
-            "-ss",
-            &seconds(seconds_at.max(0.0)),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
             "-frames:v",
             "1",
-            "-update",
-            "1",
+            "-f",
+            "image2",
             "-q:v",
             "2",
             &frame_path.to_string_lossy(),
         ],
         "Exact frame failed",
-    )?;
+    );
+    if let Err(first_error) = first {
+        run_command(
+            &settings.ffmpeg_path,
+            &[
+                "-hide_banner",
+                "-y",
+                "-i",
+                &input_path,
+                "-ss",
+                &seconds(safe_seconds),
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-frames:v",
+                "1",
+                "-f",
+                "image2",
+                "-q:v",
+                "2",
+                &frame_path.to_string_lossy(),
+            ],
+            &first_error,
+        )?;
+    }
     Ok(frame_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-fn generate_waveform(input_path: String, points: u32, settings: AppSettings) -> Result<WaveformPeakData, String> {
+fn generate_waveform(
+    input_path: String,
+    points: u32,
+    settings: AppSettings,
+) -> Result<WaveformPeakData, String> {
     let probe = probe_video_file(&settings, Path::new(&input_path), Path::new(&input_path))?
         .ok_or_else(|| "Could not read media duration.".to_string())?;
     let sample_rate = 24_000_u32;
     let points = points.clamp(512, 65_536);
-    let sample_count = ((probe.duration_seconds.max(0.1) * sample_rate as f64).ceil() as usize).max(points as usize);
+    let sample_count = ((probe.duration_seconds.max(0.1) * sample_rate as f64).ceil() as usize)
+        .max(points as usize);
     let samples_per_peak = (sample_count as f64 / points as f64).ceil().max(1.0) as usize;
     let mut command = hidden_command(&settings.ffmpeg_path);
     command.args([
@@ -426,7 +494,9 @@ fn choose_save_folder(current: String) -> Result<Option<String>, String> {
     if !current.trim().is_empty() {
         dialog = dialog.set_directory(current);
     }
-    Ok(dialog.pick_folder().map(|path| path.to_string_lossy().to_string()))
+    Ok(dialog
+        .pick_folder()
+        .map(|path| path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -441,7 +511,15 @@ fn choose_ffmpeg_path() -> Result<Option<String>, String> {
 #[tauri::command]
 fn list_audio_devices(settings: AppSettings) -> Result<Vec<String>, String> {
     let output = hidden_command(&settings.ffmpeg_path)
-        .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
         .output()
         .map_err(|error| format!("Audio device scan failed: {}", error))?;
     let text = String::from_utf8_lossy(&output.stderr);
@@ -544,11 +622,21 @@ if ($script:result -and $script:result -ne 'cancel') { Write-Output $script:resu
 "#;
 
     let output = hidden_command("powershell.exe")
-        .args(["-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-STA",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
         .output()
         .map_err(|error| format!("Region selector failed: {}", error))?;
     if !output.status.success() {
-        return Err(format!("Region selector failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        return Err(format!(
+            "Region selector failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if text.is_empty() {
@@ -561,10 +649,18 @@ if ($script:result -and $script:result -ne 'cancel') { Write-Output $script:resu
 
 #[tauri::command]
 fn export_clip(request: ExportRequest) -> Result<ExportResult, String> {
-    export_with_encoder(&request, &request.settings.export_encoder_key, &request.output_path)
+    export_with_encoder(
+        &request,
+        &request.settings.export_encoder_key,
+        &request.output_path,
+    )
 }
 
-fn export_with_encoder(request: &ExportRequest, encoder_key: &str, output_path: &str) -> Result<ExportResult, String> {
+fn export_with_encoder(
+    request: &ExportRequest,
+    encoder_key: &str,
+    output_path: &str,
+) -> Result<ExportResult, String> {
     let started = Instant::now();
     ensure_parent(Path::new(output_path))?;
     let duration = kept_duration(request.start, request.end, &request.cuts);
@@ -573,9 +669,206 @@ fn export_with_encoder(request: &ExportRequest, encoder_key: &str, output_path: 
     }
 
     let source_path = Path::new(&request.input_path);
-    let (source_width, source_height) = source_video_dimensions(&request.settings, source_path)?;
+    let source_info = probe_video_file(&request.settings, source_path, source_path)?
+        .ok_or_else(|| "Could not read source video.".to_string())?;
+    let source_width = source_info.width;
+    let source_height = source_info.height;
+    let source_duration = source_info.duration_seconds;
     let source_has_audio = source_has_audio(&request.settings, source_path);
     let export_crop = clamp_export_crop(&request.crop, source_width, source_height);
+    let audio_kept = if request.settings.include_audio {
+        kept_segments(request.audio_start, request.audio_end, &request.audio_cuts)
+    } else {
+        Vec::new()
+    };
+    let has_audio_output = source_has_audio && !audio_kept.is_empty();
+    let audio_kbps = if has_audio_output { 96 } else { 0 };
+
+    let bytes = if request.settings.size_cap_enabled {
+        export_size_capped(
+            request,
+            encoder_key,
+            Path::new(output_path),
+            &export_crop,
+            source_width,
+            source_height,
+            source_has_audio,
+            duration,
+            audio_kbps,
+        )?
+    } else if can_copy_source_export(
+        request,
+        &export_crop,
+        source_width,
+        source_height,
+        source_duration,
+        source_has_audio,
+    ) {
+        fs::copy(&request.input_path, output_path).map_err(|error| error.to_string())?;
+        fs::metadata(output_path)
+            .map(|metadata| metadata.len())
+            .map_err(|error| error.to_string())?
+    } else {
+        export_once(
+            request,
+            encoder_key,
+            Path::new(output_path),
+            &export_crop,
+            source_width,
+            source_height,
+            source_has_audio,
+            None,
+        )?
+    };
+
+    Ok(ExportResult {
+        path: output_path.to_string(),
+        bytes,
+        seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
+fn export_size_capped(
+    request: &ExportRequest,
+    encoder_key: &str,
+    output_path: &Path,
+    crop: &Crop,
+    source_width: u32,
+    source_height: u32,
+    source_has_audio: bool,
+    duration: f64,
+    audio_kbps: u32,
+) -> Result<u64, String> {
+    let target_bytes = target_size_bytes(request.settings.max_megabytes);
+    let minimum_target_bytes = (target_bytes as f64 * 0.97).round() as u64;
+    let max_quality_kbps = request.settings.quality_target_kbps.clamp(500, 50_000);
+    let mut low = 250_u32;
+    let mut high = max_quality_kbps.max(low);
+    let mut next_kbps =
+        calculate_video_bitrate(request.settings.max_megabytes, duration, audio_kbps, high);
+    let mut best_under: Option<ExportAttemptResult> = None;
+    let mut smallest_over: Option<ExportAttemptResult> = None;
+    let mut last_error: Option<String> = None;
+    let mut attempts = Vec::new();
+
+    for attempt in 0..5 {
+        let attempt_path = attempt_output_path(output_path, attempt);
+        attempts.push(attempt_path.clone());
+        match export_once(
+            request,
+            encoder_key,
+            &attempt_path,
+            crop,
+            source_width,
+            source_height,
+            source_has_audio,
+            Some(next_kbps),
+        ) {
+            Ok(bytes) => {
+                let result = ExportAttemptResult {
+                    path: attempt_path,
+                    bytes,
+                    kbps: next_kbps,
+                };
+                if bytes <= target_bytes {
+                    if best_under.as_ref().map_or(true, |best| bytes > best.bytes) {
+                        best_under = Some(result);
+                    }
+                    if bytes >= minimum_target_bytes {
+                        break;
+                    }
+                    low = next_kbps.saturating_add(1).min(high);
+                    if low >= high {
+                        break;
+                    }
+                    let ratio = target_bytes as f64 / bytes.max(1) as f64;
+                    next_kbps =
+                        ((next_kbps as f64 * ratio * 0.995).round() as u32).clamp(low, high);
+                } else {
+                    if smallest_over
+                        .as_ref()
+                        .map_or(true, |best| bytes < best.bytes)
+                    {
+                        smallest_over = Some(result);
+                    }
+                    high = next_kbps.saturating_sub(1).max(low);
+                    if low >= high {
+                        break;
+                    }
+                    let ratio = target_bytes as f64 / bytes.max(1) as f64;
+                    next_kbps =
+                        ((next_kbps as f64 * ratio * 0.985).round() as u32).clamp(low, high);
+                }
+            }
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+
+    if let Some(best) = best_under {
+        fs::copy(&best.path, output_path).map_err(|error| error.to_string())?;
+        cleanup_attempts(&attempts, Some(&best.path));
+        return Ok(fs::metadata(output_path)
+            .map_err(|error| error.to_string())?
+            .len());
+    }
+
+    cleanup_attempts(&attempts, None);
+    if let Some(over) = smallest_over {
+        return Err(format!(
+            "Export could not fit under {:.1} MB after 5 tries. Smallest result was {} at {} kbps.",
+            request.settings.max_megabytes,
+            format_bytes_raw(over.bytes),
+            over.kbps
+        ));
+    }
+    Err(last_error
+        .unwrap_or_else(|| "Export failed before producing a size-capped file.".to_string()))
+}
+
+fn export_once(
+    request: &ExportRequest,
+    encoder_key: &str,
+    output_path: &Path,
+    crop: &Crop,
+    source_width: u32,
+    source_height: u32,
+    source_has_audio: bool,
+    video_kbps: Option<u32>,
+) -> Result<u64, String> {
+    let args = build_export_args(
+        request,
+        encoder_key,
+        &output_path.to_string_lossy(),
+        crop,
+        source_width,
+        source_height,
+        source_has_audio,
+        video_kbps,
+    );
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Err(error) = run_command(&request.settings.ffmpeg_path, &arg_refs, "Export failed") {
+        remove_empty_file(output_path);
+        return Err(error);
+    }
+    fs::metadata(output_path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| error.to_string())
+}
+
+fn build_export_args(
+    request: &ExportRequest,
+    encoder_key: &str,
+    output_path: &str,
+    crop: &Crop,
+    source_width: u32,
+    source_height: u32,
+    source_has_audio: bool,
+    video_kbps: Option<u32>,
+) -> Vec<String> {
+    let duration = kept_duration(request.start, request.end, &request.cuts);
     let video_kept = kept_segments(request.start, request.end, &request.cuts);
     let audio_kept = if request.settings.include_audio {
         kept_segments(request.audio_start, request.audio_end, &request.audio_cuts)
@@ -584,9 +877,12 @@ fn export_with_encoder(request: &ExportRequest, encoder_key: &str, output_path: 
     };
     let has_audio_output = source_has_audio && !audio_kept.is_empty();
     let audio_edit_matches_video = ranges_equal(&video_kept, &audio_kept);
-    let audio_kbps = if has_audio_output { 96 } else { 0 };
-    let video_kbps = calculate_video_bitrate(request.settings.max_megabytes, duration, audio_kbps);
-    let mut args = vec!["-hide_banner".to_string(), "-y".to_string(), "-i".to_string(), request.input_path.clone()];
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-y".to_string(),
+        "-i".to_string(),
+        request.input_path.clone(),
+    ];
 
     if request.cuts.is_empty() && (!has_audio_output || audio_edit_matches_video) {
         args.extend([
@@ -595,57 +891,100 @@ fn export_with_encoder(request: &ExportRequest, encoder_key: &str, output_path: 
             "-t".to_string(),
             seconds(duration),
         ]);
-        let filters = build_filters(&request, &export_crop);
+        let filters = build_filters(request, crop, source_width, source_height);
         if !filters.is_empty() {
             args.extend(["-vf".to_string(), filters]);
         }
         args.extend(["-map".to_string(), "0:v:0".to_string()]);
         if has_audio_output {
-            args.extend(["-map".to_string(), "0:a?".to_string(), "-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "96k".to_string()]);
+            args.extend([
+                "-map".to_string(),
+                "0:a?".to_string(),
+                "-c:a".to_string(),
+                "aac".to_string(),
+                "-b:a".to_string(),
+                "96k".to_string(),
+            ]);
             if request.settings.audio_gain_db.abs() > 0.01 {
-                args.extend(["-af".to_string(), format!("volume={:.6}", db_to_linear(request.settings.audio_gain_db))]);
+                args.extend([
+                    "-af".to_string(),
+                    format!("volume={:.6}", db_to_linear(request.settings.audio_gain_db)),
+                ]);
             }
         } else {
             args.push("-an".to_string());
         }
     } else {
-        let (filter_complex, has_audio) = build_cut_filter(&request, &export_crop, source_has_audio);
+        let (filter_complex, has_audio) =
+            build_cut_filter(request, crop, source_width, source_height, source_has_audio);
         args.extend(["-filter_complex".to_string(), filter_complex]);
         if has_audio {
-            args.extend(["-map".to_string(), "[outv]".to_string(), "-map".to_string(), "[outa]".to_string(), "-c:a".to_string(), "aac".to_string(), "-b:a".to_string(), "96k".to_string()]);
+            args.extend([
+                "-map".to_string(),
+                "[outv]".to_string(),
+                "-map".to_string(),
+                "[outa]".to_string(),
+                "-c:a".to_string(),
+                "aac".to_string(),
+                "-b:a".to_string(),
+                "96k".to_string(),
+            ]);
         } else {
             args.extend(["-map".to_string(), "[outv]".to_string(), "-an".to_string()]);
         }
     }
 
-    args.extend(["-r".to_string(), request.settings.frame_rate.clamp(5, 60).to_string()]);
-    args.extend(encoder_args(encoder_key));
     args.extend([
-        "-b:v".to_string(),
-        format!("{}k", video_kbps),
-        "-maxrate".to_string(),
-        format!("{}k", video_kbps),
-        "-bufsize".to_string(),
-        format!("{}k", video_kbps * 2),
+        "-r".to_string(),
+        request.settings.frame_rate.clamp(5, 60).to_string(),
+    ]);
+    args.extend(encoder_args(encoder_key));
+    if let Some(kbps) = video_kbps {
+        args.extend([
+            "-b:v".to_string(),
+            format!("{}k", kbps),
+            "-maxrate".to_string(),
+            format!("{}k", kbps),
+            "-bufsize".to_string(),
+            format!("{}k", kbps.saturating_mul(2)),
+        ]);
+    } else {
+        args.extend(preserve_quality_args(encoder_key));
+    }
+    args.extend([
         "-movflags".to_string(),
         "+faststart".to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         output_path.to_string(),
     ]);
+    args
+}
 
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    if let Err(error) = run_command(&request.settings.ffmpeg_path, &arg_refs, "Export failed") {
-        remove_empty_file(Path::new(output_path));
-        return Err(error);
-    }
-    let bytes = fs::metadata(output_path).map_err(|error| error.to_string())?.len();
-
-    Ok(ExportResult {
-        path: output_path.to_string(),
-        bytes,
-        seconds: started.elapsed().as_secs_f64(),
-    })
+fn can_copy_source_export(
+    request: &ExportRequest,
+    crop: &Crop,
+    source_width: u32,
+    source_height: u32,
+    source_duration: f64,
+    source_has_audio: bool,
+) -> bool {
+    let video_is_full_source =
+        request.start <= 0.001 && request.cuts.is_empty() && (request.end - source_duration).abs() <= 0.05;
+    let audio_is_full_source = !source_has_audio
+        || (request.settings.include_audio
+            && request.audio_start <= 0.001
+            && request.audio_cuts.is_empty()
+            && (request.audio_end - request.end).abs() <= 0.05
+            && request.settings.audio_gain_db.abs() <= 0.01);
+    let transform_is_source = crop.x == 0
+        && crop.y == 0
+        && crop.width == source_width
+        && crop.height == source_height
+        && !request.auto_fit720
+        && make_even(request.output_width) == source_width
+        && make_even(request.output_height) == source_height;
+    video_is_full_source && audio_is_full_source && transform_is_source
 }
 
 #[tauri::command]
@@ -705,8 +1044,14 @@ fn benchmark_encoders(request: ExportRequest) -> Result<Vec<BenchmarkResult>, St
 }
 
 #[tauri::command]
-fn start_recording(request: RecordingRequest, state: State<'_, AppState>) -> Result<String, String> {
-    let mut recording = state.recording.lock().map_err(|_| "Recording lock failed.".to_string())?;
+fn start_recording(
+    request: RecordingRequest,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut recording = state
+        .recording
+        .lock()
+        .map_err(|_| "Recording lock failed.".to_string())?;
     if recording.is_some() {
         return Err("Recording is already running.".to_string());
     }
@@ -767,7 +1112,11 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
         .map_err(|error| format!("Could not start FFmpeg: {}", error))?;
 
     thread::sleep(Duration::from_millis(250));
-    if child.try_wait().map_err(|error| error.to_string())?.is_some() {
+    if child
+        .try_wait()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
         let mut stderr = String::new();
         if let Some(mut pipe) = child.stderr.take() {
             let _ = pipe.read_to_string(&mut stderr);
@@ -781,12 +1130,20 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
         None
     };
     let overlay_child = start_recording_overlay(request.x, request.y, width, height).ok();
-    Ok(ActiveRecording { child, overlay_child, audio, path })
+    Ok(ActiveRecording {
+        child,
+        overlay_child,
+        audio,
+        path,
+    })
 }
 
 #[tauri::command]
 fn stop_recording(settings: AppSettings, state: State<'_, AppState>) -> Result<VideoInfo, String> {
-    let mut guard = state.recording.lock().map_err(|_| "Recording lock failed.".to_string())?;
+    let mut guard = state
+        .recording
+        .lock()
+        .map_err(|_| "Recording lock failed.".to_string())?;
     let Some(mut recording) = guard.take() else {
         return Err("No recording is running.".to_string());
     };
@@ -799,9 +1156,15 @@ fn stop_recording(settings: AppSettings, state: State<'_, AppState>) -> Result<V
             }
         }
     }
-    let output = recording.child.wait_with_output().map_err(|error| error.to_string())?;
+    let output = recording
+        .child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
     if !output.status.success() {
-        return Err(format!("Recording failed: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "Recording failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     if let Some(audio_path) = stop_loopback_recording(recording.audio.take())? {
         mux_recording_audio(&settings.ffmpeg_path, &recording.path, &audio_path)?;
@@ -812,8 +1175,14 @@ fn stop_recording(settings: AppSettings, state: State<'_, AppState>) -> Result<V
 }
 
 #[tauri::command]
-fn reset_recording(request: RecordingRequest, state: State<'_, AppState>) -> Result<String, String> {
-    let mut guard = state.recording.lock().map_err(|_| "Recording lock failed.".to_string())?;
+fn reset_recording(
+    request: RecordingRequest,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut guard = state
+        .recording
+        .lock()
+        .map_err(|_| "Recording lock failed.".to_string())?;
     if let Some(mut recording) = guard.take() {
         let path = recording.path.clone();
         stop_recording_overlay(&mut recording.overlay_child);
@@ -852,14 +1221,19 @@ fn copy_file_to_clipboard(path: String) -> Result<(), String> {
     if !path.is_file() {
         return Err("Export file does not exist.".to_string());
     }
-    let mut clipboard = arboard::Clipboard::new().map_err(|error| format!("Could not open clipboard: {}", error))?;
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("Could not open clipboard: {}", error))?;
     clipboard
         .set()
         .file_list(&[path])
         .map_err(|error| format!("Could not copy file to clipboard: {}", error))
 }
 
-fn probe_video_file(settings: &AppSettings, media_path: &Path, original_path: &Path) -> Result<Option<VideoInfo>, String> {
+fn probe_video_file(
+    settings: &AppSettings,
+    media_path: &Path,
+    original_path: &Path,
+) -> Result<Option<VideoInfo>, String> {
     let ffprobe = sibling_tool(&settings.ffmpeg_path, "ffprobe.exe");
     let output = hidden_command(&ffprobe)
         .args([
@@ -950,42 +1324,6 @@ fn is_browser_safe_playback(settings: &AppSettings, media_path: &Path) -> Result
     Ok(codec == "h264" && pix_fmt == "yuv420p")
 }
 
-fn source_video_dimensions(settings: &AppSettings, media_path: &Path) -> Result<(u32, u32), String> {
-    let ffprobe = sibling_tool(&settings.ffmpeg_path, "ffprobe.exe");
-    let output = hidden_command(&ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "default=noprint_wrappers=1",
-            &media_path.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(command_error_message("Source probe failed", &String::from_utf8_lossy(&output.stderr)));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut width = 0;
-    let mut height = 0;
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("width=") {
-            width = value.parse().unwrap_or(0);
-        } else if let Some(value) = line.strip_prefix("height=") {
-            height = value.parse().unwrap_or(0);
-        }
-    }
-    if width < 2 || height < 2 {
-        return Err("Source probe failed: invalid video dimensions.".to_string());
-    }
-    Ok((width, height))
-}
-
 fn source_has_audio(settings: &AppSettings, media_path: &Path) -> bool {
     let ffprobe = sibling_tool(&settings.ffmpeg_path, "ffprobe.exe");
     hidden_command(&ffprobe)
@@ -1001,12 +1339,17 @@ fn source_has_audio(settings: &AppSettings, media_path: &Path) -> bool {
             &media_path.to_string_lossy(),
         ])
         .output()
-        .map(|output| output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+        .map(|output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        })
         .unwrap_or(false)
 }
 
 fn import_to_workspace(source: &Path) -> Result<PathBuf, String> {
-    let extension = source.extension().and_then(|value| value.to_str()).unwrap_or("mp4");
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4");
     let destination = media_root()?.join(format!("source-{}.{}", timestamp(), extension));
     fs::copy(source, &destination).map_err(|error| error.to_string())?;
     Ok(destination)
@@ -1077,7 +1420,9 @@ fn start_loopback_recording() -> Result<LoopbackRecording, String> {
     Err("System audio capture is only available on Windows.".to_string())
 }
 
-fn stop_loopback_recording(recording: Option<LoopbackRecording>) -> Result<Option<PathBuf>, String> {
+fn stop_loopback_recording(
+    recording: Option<LoopbackRecording>,
+) -> Result<Option<PathBuf>, String> {
     let Some(recording) = recording else {
         return Ok(None);
     };
@@ -1089,19 +1434,23 @@ fn stop_loopback_recording(recording: Option<LoopbackRecording>) -> Result<Optio
 }
 
 #[cfg(windows)]
-fn capture_loopback_to_wav(stop: Arc<AtomicBool>, path: PathBuf) -> Result<Option<PathBuf>, String> {
+fn capture_loopback_to_wav(
+    stop: Arc<AtomicBool>,
+    path: PathBuf,
+) -> Result<Option<PathBuf>, String> {
     use std::{ptr::null_mut, slice};
-    use windows::{
-        Win32::{
-            Media::Audio::{
-                eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-                MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
+    use windows::Win32::{
+        Media::Audio::{
+            eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
+            MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
+        },
+        System::{
+            Com::{
+                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+                COINIT_MULTITHREADED,
             },
-            System::{
-                Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED},
-                Threading::Sleep,
-            },
+            Threading::Sleep,
         },
     };
 
@@ -1111,14 +1460,17 @@ fn capture_loopback_to_wav(stop: Arc<AtomicBool>, path: PathBuf) -> Result<Optio
             .map_err(|error| error.to_string())?;
         let result = (|| -> Result<Option<PathBuf>, String> {
             let enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|error| error.to_string())?;
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|error| error.to_string())?;
             let device = enumerator
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .map_err(|error| error.to_string())?;
             let audio_client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|error| error.to_string())?;
-            let mix_format = audio_client.GetMixFormat().map_err(|error| error.to_string())?;
+            let mix_format = audio_client
+                .GetMixFormat()
+                .map_err(|error| error.to_string())?;
             if mix_format.is_null() {
                 return Err("Windows returned an empty audio mix format.".to_string());
             }
@@ -1141,7 +1493,9 @@ fn capture_loopback_to_wav(stop: Arc<AtomicBool>, path: PathBuf) -> Result<Optio
                 )
                 .map_err(|error| error.to_string())?;
 
-            let capture_client: IAudioCaptureClient = audio_client.GetService().map_err(|error| error.to_string())?;
+            let capture_client: IAudioCaptureClient = audio_client
+                .GetService()
+                .map_err(|error| error.to_string())?;
             let mut file = fs::File::create(&path).map_err(|error| error.to_string())?;
             let format_bytes = slice::from_raw_parts(
                 mix_format.cast::<u8>(),
@@ -1153,7 +1507,9 @@ fn capture_loopback_to_wav(stop: Arc<AtomicBool>, path: PathBuf) -> Result<Optio
             audio_client.Start().map_err(|error| error.to_string())?;
             let mut data_bytes: u32 = 0;
             while !stop.load(Ordering::SeqCst) {
-                let mut next_packet_frames = capture_client.GetNextPacketSize().map_err(|error| error.to_string())?;
+                let mut next_packet_frames = capture_client
+                    .GetNextPacketSize()
+                    .map_err(|error| error.to_string())?;
                 if next_packet_frames == 0 {
                     Sleep(10);
                     continue;
@@ -1169,15 +1525,20 @@ fn capture_loopback_to_wav(stop: Arc<AtomicBool>, path: PathBuf) -> Result<Optio
                     let bytes = frames as usize * frame_bytes;
                     if bytes > 0 {
                         if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
-                            file.write_all(&vec![0u8; bytes]).map_err(|error| error.to_string())?;
+                            file.write_all(&vec![0u8; bytes])
+                                .map_err(|error| error.to_string())?;
                         } else {
                             file.write_all(slice::from_raw_parts(data.cast::<u8>(), bytes))
                                 .map_err(|error| error.to_string())?;
                         }
                         data_bytes = data_bytes.saturating_add(bytes as u32);
                     }
-                    capture_client.ReleaseBuffer(frames).map_err(|error| error.to_string())?;
-                    next_packet_frames = capture_client.GetNextPacketSize().map_err(|error| error.to_string())?;
+                    capture_client
+                        .ReleaseBuffer(frames)
+                        .map_err(|error| error.to_string())?;
+                    next_packet_frames = capture_client
+                        .GetNextPacketSize()
+                        .map_err(|error| error.to_string())?;
                 }
             }
 
@@ -1196,41 +1557,61 @@ fn capture_loopback_to_wav(stop: Arc<AtomicBool>, path: PathBuf) -> Result<Optio
     }
 }
 
-fn write_wave_header(file: &mut fs::File, format_bytes: &[u8], data_bytes: u32) -> Result<(), String> {
+fn write_wave_header(
+    file: &mut fs::File,
+    format_bytes: &[u8],
+    data_bytes: u32,
+) -> Result<(), String> {
     let riff_bytes = 4u32
         .saturating_add(8)
         .saturating_add(format_bytes.len() as u32)
         .saturating_add(8)
         .saturating_add(data_bytes);
-    file.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
     file.write_all(b"RIFF").map_err(|error| error.to_string())?;
-    file.write_all(&riff_bytes.to_le_bytes()).map_err(|error| error.to_string())?;
-    file.write_all(b"WAVEfmt ").map_err(|error| error.to_string())?;
+    file.write_all(&riff_bytes.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.write_all(b"WAVEfmt ")
+        .map_err(|error| error.to_string())?;
     file.write_all(&(format_bytes.len() as u32).to_le_bytes())
         .map_err(|error| error.to_string())?;
-    file.write_all(format_bytes).map_err(|error| error.to_string())?;
+    file.write_all(format_bytes)
+        .map_err(|error| error.to_string())?;
     file.write_all(b"data").map_err(|error| error.to_string())?;
-    file.write_all(&data_bytes.to_le_bytes()).map_err(|error| error.to_string())?;
+    file.write_all(&data_bytes.to_le_bytes())
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
 fn finalize_wave_header(file: &mut fs::File, data_bytes: u32) -> Result<(), String> {
     file.flush().map_err(|error| error.to_string())?;
     let current = file.stream_position().map_err(|error| error.to_string())?;
-    file.seek(SeekFrom::Start(4)).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(4))
+        .map_err(|error| error.to_string())?;
     file.write_all(&(current.saturating_sub(8) as u32).to_le_bytes())
         .map_err(|error| error.to_string())?;
     let data_size_offset = current.saturating_sub(data_bytes as u64).saturating_sub(4);
     file.seek(SeekFrom::Start(data_size_offset))
         .map_err(|error| error.to_string())?;
-    file.write_all(&data_bytes.to_le_bytes()).map_err(|error| error.to_string())?;
-    file.seek(SeekFrom::End(0)).map_err(|error| error.to_string())?;
+    file.write_all(&data_bytes.to_le_bytes())
+        .map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|error| error.to_string())?;
     file.flush().map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn mux_recording_audio(ffmpeg_path: &str, video_path: &Path, audio_path: &Path) -> Result<(), String> {
-    if fs::metadata(audio_path).map(|metadata| metadata.len()).unwrap_or(0) <= 64 {
+fn mux_recording_audio(
+    ffmpeg_path: &str,
+    video_path: &Path,
+    audio_path: &Path,
+) -> Result<(), String> {
+    if fs::metadata(audio_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        <= 64
+    {
         let _ = fs::remove_file(audio_path);
         return Ok(());
     }
@@ -1365,12 +1746,19 @@ fn run_command(exe: &str, args: &[&str], label: &str) -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(command_error_message(label, &String::from_utf8_lossy(&output.stderr)))
+        Err(command_error_message(
+            label,
+            &String::from_utf8_lossy(&output.stderr),
+        ))
     }
 }
 
 fn command_error_message(label: &str, stderr: &str) -> String {
-    let lines = stderr.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    let lines = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
     let preferred = lines
         .iter()
         .rev()
@@ -1399,7 +1787,11 @@ fn command_error_message(label: &str, stderr: &str) -> String {
 }
 
 fn remove_empty_file(path: &Path) {
-    if fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(1) == 0 {
+    if fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(1)
+        == 0
+    {
         let _ = fs::remove_file(path);
     }
 }
@@ -1417,9 +1809,18 @@ fn clamp_export_crop(crop: &Crop, source_width: u32, source_height: u32) -> Crop
     }
 }
 
-fn build_filters(request: &ExportRequest, crop: &Crop) -> String {
+fn build_filters(
+    request: &ExportRequest,
+    crop: &Crop,
+    source_width: u32,
+    source_height: u32,
+) -> String {
     let mut filters = Vec::new();
-    if crop.width > 0 && crop.height > 0 {
+    let cropped =
+        crop.x > 0 || crop.y > 0 || crop.width != source_width || crop.height != source_height;
+    let mut current_width = source_width;
+    let mut current_height = source_height;
+    if cropped && crop.width > 0 && crop.height > 0 {
         filters.push(format!(
             "crop={}:{}:{}:{}",
             make_even(crop.width),
@@ -1427,30 +1828,50 @@ fn build_filters(request: &ExportRequest, crop: &Crop) -> String {
             crop.x,
             crop.y
         ));
+        current_width = make_even(crop.width);
+        current_height = make_even(crop.height);
     }
 
     if request.auto_fit720 {
         filters.push("crop=min(iw\\,ih*16/9):min(ih\\,iw*9/16):(iw-ow)/2:(ih-oh)/2".to_string());
         filters.push("scale=1280:720".to_string());
-    } else if request.output_width > 0 && request.output_height > 0 {
-        filters.push(format!("scale={}:{}", make_even(request.output_width), make_even(request.output_height)));
+    } else if request.output_width > 0
+        && request.output_height > 0
+        && (make_even(request.output_width) != current_width
+            || make_even(request.output_height) != current_height)
+    {
+        filters.push(format!(
+            "scale={}:{}",
+            make_even(request.output_width),
+            make_even(request.output_height)
+        ));
     }
 
     filters.join(",")
 }
 
-fn build_cut_filter(request: &ExportRequest, crop: &Crop, source_has_audio: bool) -> (String, bool) {
+fn build_cut_filter(
+    request: &ExportRequest,
+    crop: &Crop,
+    source_width: u32,
+    source_height: u32,
+    source_has_audio: bool,
+) -> (String, bool) {
     let video_kept = kept_segments(request.start, request.end, &request.cuts);
     let audio_kept = if request.settings.include_audio && source_has_audio {
         kept_segments(request.audio_start, request.audio_end, &request.audio_cuts)
     } else {
         Vec::new()
     };
-    let filters = build_filters(request, crop);
+    let filters = build_filters(request, crop, source_width, source_height);
     let has_audio = !audio_kept.is_empty();
     let mut parts = Vec::new();
     for (index, (start, end)) in video_kept.iter().enumerate() {
-        let mut video = format!("[0:v]trim=start={}:end={},setpts=PTS-STARTPTS", seconds(*start), seconds(*end));
+        let mut video = format!(
+            "[0:v]trim=start={}:end={},setpts=PTS-STARTPTS",
+            seconds(*start),
+            seconds(*end)
+        );
         if !filters.is_empty() {
             video.push(',');
             video.push_str(&filters);
@@ -1459,8 +1880,15 @@ fn build_cut_filter(request: &ExportRequest, crop: &Crop, source_has_audio: bool
         parts.push(video);
     }
 
-    let video_inputs = (0..video_kept.len()).map(|index| format!("[v{}]", index)).collect::<Vec<_>>().join("");
-    parts.push(format!("{}concat=n={}:v=1:a=0[outv]", video_inputs, video_kept.len()));
+    let video_inputs = (0..video_kept.len())
+        .map(|index| format!("[v{}]", index))
+        .collect::<Vec<_>>()
+        .join("");
+    parts.push(format!(
+        "{}concat=n={}:v=1:a=0[outv]",
+        video_inputs,
+        video_kept.len()
+    ));
 
     if has_audio {
         for (index, (start, end)) in audio_kept.iter().enumerate() {
@@ -1472,15 +1900,26 @@ fn build_cut_filter(request: &ExportRequest, crop: &Crop, source_has_audio: bool
                 index
             ));
         }
-        let audio_inputs = (0..audio_kept.len()).map(|index| format!("[a{}]", index)).collect::<Vec<_>>().join("");
-        parts.push(format!("{}concat=n={}:v=0:a=1[outa]", audio_inputs, audio_kept.len()));
+        let audio_inputs = (0..audio_kept.len())
+            .map(|index| format!("[a{}]", index))
+            .collect::<Vec<_>>()
+            .join("");
+        parts.push(format!(
+            "{}concat=n={}:v=0:a=1[outa]",
+            audio_inputs,
+            audio_kept.len()
+        ));
     }
     (parts.join(";"), has_audio)
 }
 
 fn kept_segments(start: f64, end: f64, cuts: &[CutRange]) -> Vec<(f64, f64)> {
     let mut ranges = cuts.to_vec();
-    ranges.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    ranges.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut cursor = start;
     let mut kept = Vec::new();
     for cut in ranges {
@@ -1509,17 +1948,59 @@ fn kept_duration(start: f64, end: f64, cuts: &[CutRange]) -> f64 {
 
 fn ranges_equal(left: &[(f64, f64)], right: &[(f64, f64)]) -> bool {
     left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|((left_start, left_end), (right_start, right_end))| {
+        && left.iter().zip(right.iter()).all(
+            |((left_start, left_end), (right_start, right_end))| {
                 (left_start - right_start).abs() < 0.001 && (left_end - right_end).abs() < 0.001
-            })
+            },
+        )
 }
 
-fn calculate_video_bitrate(max_mb: f64, duration: f64, audio_kbps: u32) -> u32 {
+fn target_size_bytes(max_mb: f64) -> u64 {
+    (max_mb.max(0.1) * 1024.0 * 1024.0).round() as u64
+}
+
+fn attempt_output_path(output_path: &Path, attempt: usize) -> PathBuf {
+    let parent = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = output_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("clip");
+    let extension = output_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4");
+    parent.join(format!("{}.sizecap-{}.{}", stem, attempt + 1, extension))
+}
+
+fn cleanup_attempts(paths: &[PathBuf], keep: Option<&Path>) {
+    for path in paths {
+        if keep.is_some_and(|kept| kept == path) {
+            continue;
+        }
+        let _ = fs::remove_file(path);
+    }
+    if let Some(path) = keep {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn format_bytes_raw(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    format!("{:.2} MB", mb)
+}
+
+fn calculate_video_bitrate(
+    max_mb: f64,
+    duration: f64,
+    audio_kbps: u32,
+    max_video_kbps: u32,
+) -> u32 {
     let total_kbits = max_mb.max(0.1) * 8192.0 * 0.985;
-    ((total_kbits / duration.max(0.5)) as i32 - audio_kbps as i32).clamp(250, 12000) as u32
+    ((total_kbits / duration.max(0.5)) as i32 - audio_kbps as i32).clamp(250, max_video_kbps as i32)
+        as u32
 }
 
 fn db_to_linear(db: f64) -> f64 {
@@ -1545,6 +2026,17 @@ fn encoder_args(key: &str) -> Vec<String> {
     .collect()
 }
 
+fn preserve_quality_args(key: &str) -> Vec<String> {
+    let args = if key.contains("nvenc") {
+        vec!["-rc", "vbr", "-cq", "18", "-b:v", "0"]
+    } else if key.contains("x265") {
+        vec!["-crf", "20"]
+    } else {
+        vec!["-crf", "18"]
+    };
+    args.into_iter().map(str::to_string).collect()
+}
+
 fn encoder_presets() -> Vec<(&'static str, &'static str)> {
     vec![
         ("x264-medium", "H.264 Medium"),
@@ -1562,7 +2054,11 @@ fn encoder_presets() -> Vec<(&'static str, &'static str)> {
 }
 
 fn make_even(value: u32) -> u32 {
-    if value % 2 == 0 { value } else { value.saturating_sub(1).max(2) }
+    if value % 2 == 0 {
+        value
+    } else {
+        value.saturating_sub(1).max(2)
+    }
 }
 
 fn even_floor(value: u32) -> u32 {
@@ -1594,29 +2090,28 @@ fn create_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(icon) = app.default_window_icon().cloned() {
         tray = tray.icon(icon);
     }
-    tray
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "open" => show_main_window(app),
-            "record" => {
-                let _ = app.emit("tray-record-toggle", ());
-            }
-            "reset" => {
-                let _ = app.emit("tray-record-reset", ());
-            }
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_main_window(tray.app_handle());
-            }
-        })
-        .build(app)?;
+    tray.on_menu_event(|app, event| match event.id.as_ref() {
+        "open" => show_main_window(app),
+        "record" => {
+            let _ = app.emit("tray-record-toggle", ());
+        }
+        "reset" => {
+            let _ = app.emit("tray-record-reset", ());
+        }
+        "quit" => app.exit(0),
+        _ => {}
+    })
+    .on_tray_icon_event(|tray, event| {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
+            show_main_window(tray.app_handle());
+        }
+    })
+    .build(app)?;
 
     Ok(())
 }

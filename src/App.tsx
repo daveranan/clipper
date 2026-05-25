@@ -24,6 +24,7 @@ import {
   Pause,
   Play,
   Radio,
+  RotateCcw,
   Scissors,
   Settings2,
   SkipBack,
@@ -50,7 +51,7 @@ const defaultSettings: AppSettings = {
   ffmpegPath: 'ffmpeg',
   frameRate: 30,
   maxMegabytes: 9.8,
-  qualityLengthCapEnabled: true,
+  sizeCapEnabled: true,
   qualityTargetKbps: 10000,
   exportEncoderKey: 'x264-medium',
   exportBitrateScale: 1,
@@ -922,17 +923,52 @@ function MainApp() {
   }
 
   const applyQualityCap = () => {
-    if (!clip || !settings.qualityLengthCapEnabled) {
+    if (!clip) {
       return
     }
     const nextEnd = Math.min(clip.durationSeconds, trimStart + qualityMaxSeconds)
-    beginEdit('Length cap')
+    beginEdit('Length limit')
     setTrimEnd(nextEnd)
     if (syncLinked) {
       setAudioTrimEnd(nextEnd)
     }
     setCurrentTime((value) => Math.min(value, nextEnd))
     finishEdit()
+  }
+
+  const resetClipEdits = () => {
+    if (!clip) {
+      return
+    }
+    beginEdit('Reset edits')
+    setIsPlaying(false)
+    currentTimeRef.current = 0
+    setCurrentTime(0)
+    setExactFrame(null)
+    setTrimStart(0)
+    setTrimEnd(clip.durationSeconds)
+    setTimelineOffset(0)
+    setAudioTrimStart(0)
+    setAudioTrimEnd(clip.durationSeconds)
+    setAudioTimelineOffset(0)
+    setCuts([])
+    setAudioCuts([])
+    setPendingCutStart(null)
+    setSelectedClip(null)
+    setCrop({ x: 0, y: 0, width: clip.width, height: clip.height })
+    setOutputWidth(makeEven(clip.width))
+    setOutputHeight(makeEven(clip.height))
+    setAutoFit720(false)
+    setTimelineZoom(1)
+    setTimelineStart(0)
+    setSyncLinked(true)
+    setSettings((value) => ({ ...value, audioGainDb: 0 }))
+    if (playbackRef.current) {
+      playbackRef.current.currentTime = 0
+      playbackRef.current.pause()
+    }
+    finishEdit()
+    setStatus('Edits reset')
   }
 
   useEffect(() => {
@@ -1325,15 +1361,15 @@ function MainApp() {
           </label>
           <label
             className="top-toggle has-tooltip"
-            data-tooltip={`Cap limits the kept clip length to what can fit under ${settings.maxMegabytes.toFixed(1)} MB using the current output size and bitrate target. Use Apply Length Cap in Output to set the out point.`}
-            title="Limit clip length for the target file size."
+            data-tooltip={`Size Cap targets ${settings.maxMegabytes.toFixed(1)} MB by adjusting export bitrate and retrying up to 5 times. Turn it off to preserve source quality instead of shrinking the file.`}
+            title="Target a maximum exported file size."
           >
             <input
               type="checkbox"
-              checked={settings.qualityLengthCapEnabled}
-              onChange={(event) => setSettings((value) => ({ ...value, qualityLengthCapEnabled: event.target.checked }))}
+              checked={settings.sizeCapEnabled}
+              onChange={(event) => setSettings((value) => ({ ...value, sizeCapEnabled: event.target.checked }))}
             />
-            Cap
+            Size Cap
           </label>
           <Button variant="primary" disabled={!clip || isExporting} onClick={exportClip}>
             <Upload />
@@ -1370,6 +1406,10 @@ function MainApp() {
               <Button className="w-full justify-start" variant="subtle" disabled={!isRecording} onClick={resetRecording}>
                 <Timer />
                 Reset Recording
+              </Button>
+              <Button className="w-full justify-start" variant="subtle" disabled={!clip} onClick={resetClipEdits}>
+                <RotateCcw />
+                Reset Edits
               </Button>
               <div className="media-item selected">
                 <Film className="size-8" />
@@ -1472,7 +1512,7 @@ function MainApp() {
               <NumberField label="Max MB" value={settings.maxMegabytes} step={0.1} onChange={(maxMegabytes) => setSettings((value) => ({ ...value, maxMegabytes }))} />
               <Button className="w-full" variant="subtle" disabled={!clip} onClick={applyQualityCap}>
                 <Timer />
-                Apply Length Cap
+                Apply Max Length
               </Button>
               <Separator />
               <div className="section-label">
@@ -1480,10 +1520,10 @@ function MainApp() {
                 Crop
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <NumberField label="X" value={crop.x} onChange={(x) => { beginEdit('Crop field'); setCrop((value) => ({ ...value, x })); finishEdit() }} />
-                <NumberField label="Y" value={crop.y} onChange={(y) => { beginEdit('Crop field'); setCrop((value) => ({ ...value, y })); finishEdit() }} />
-                <NumberField label="W" value={crop.width} onChange={(width) => { beginEdit('Crop field'); setCrop((value) => ({ ...value, width: makeEven(width) })); finishEdit() }} />
-                <NumberField label="H" value={crop.height} onChange={(height) => { beginEdit('Crop field'); setCrop((value) => ({ ...value, height: makeEven(height) })); finishEdit() }} />
+                <NumberField label="X" value={crop.x} onChange={(x) => { beginEdit('Crop field'); setCrop((value) => clip ? clampCrop({ ...value, x }, clip.width, clip.height) : { ...value, x }); finishEdit() }} />
+                <NumberField label="Y" value={crop.y} onChange={(y) => { beginEdit('Crop field'); setCrop((value) => clip ? clampCrop({ ...value, y }, clip.width, clip.height) : { ...value, y }); finishEdit() }} />
+                <NumberField label="W" value={crop.width} onChange={(width) => { beginEdit('Crop field'); setCrop((value) => clip ? clampCrop({ ...value, width: makeEven(width) }, clip.width, clip.height) : { ...value, width: makeEven(width) }); finishEdit() }} />
+                <NumberField label="H" value={crop.height} onChange={(height) => { beginEdit('Crop field'); setCrop((value) => clip ? clampCrop({ ...value, height: makeEven(height) }, clip.width, clip.height) : { ...value, height: makeEven(height) }); finishEdit() }} />
               </div>
               <Separator />
               <div className="section-label">
@@ -1498,12 +1538,17 @@ function MainApp() {
                 className="w-full"
                 variant={autoFit720 ? 'primary' : 'default'}
                 onClick={() => {
+                  if (!clip) {
+                    return
+                  }
                   beginEdit('Auto resize')
                   setAutoFit720(true)
+                  setCrop(cropForAspect(clip.width, clip.height, 16 / 9))
                   setOutputWidth(1280)
                   setOutputHeight(720)
                   finishEdit()
                 }}
+                disabled={!clip}
               >
                 Auto 1280 x 720
               </Button>
@@ -1557,7 +1602,8 @@ function MainApp() {
           <div className="timeline-stats">
             <Badge>{formatTime(trimStart)} to {formatTime(trimEnd)}</Badge>
             <Badge>{formatTime(keptSeconds)} kept</Badge>
-            <Badge>{settings.qualityLengthCapEnabled ? `${formatTime(qualityMaxSeconds)} cap` : 'cap off'}</Badge>
+            <Badge>{settings.sizeCapEnabled ? `${settings.maxMegabytes.toFixed(1)} MB target` : 'source quality'}</Badge>
+            <Badge>{formatTime(qualityMaxSeconds)} max length</Badge>
           </div>
         </div>
         <div className="timeline-grid">
@@ -2142,7 +2188,7 @@ function CropOverlay({
           : drag.mode === 'bl'
             ? { x: c.x + dx, y: c.y, width: c.width - dx, height: c.height + dy }
             : { x: c.x, y: c.y, width: c.width + dx, height: c.height + dy }
-    onChange(clampCrop(next, sourceWidth, sourceHeight))
+    onChange(clampCropForDrag(next, sourceWidth, sourceHeight, drag.mode))
   }
 
   return (
@@ -2389,6 +2435,50 @@ function clampCrop(crop: Crop, sourceWidth: number, sourceHeight: number) {
     width,
     height,
   }
+}
+
+function clampCropForDrag(crop: Crop, sourceWidth: number, sourceHeight: number, mode: 'move' | 'tl' | 'tr' | 'bl' | 'br') {
+  if (mode === 'move') {
+    return clampCrop(crop, sourceWidth, sourceHeight)
+  }
+  let left = crop.x
+  let top = crop.y
+  let right = crop.x + crop.width
+  let bottom = crop.y + crop.height
+  left = clamp(left, 0, sourceWidth - 8)
+  top = clamp(top, 0, sourceHeight - 8)
+  right = clamp(right, 8, sourceWidth)
+  bottom = clamp(bottom, 8, sourceHeight)
+  if (right - left < 8) {
+    if (mode === 'tr' || mode === 'br') {
+      right = clamp(left + 8, 8, sourceWidth)
+    } else {
+      left = clamp(right - 8, 0, sourceWidth - 8)
+    }
+  }
+  if (bottom - top < 8) {
+    if (mode === 'bl' || mode === 'br') {
+      bottom = clamp(top + 8, 8, sourceHeight)
+    } else {
+      top = clamp(bottom - 8, 0, sourceHeight - 8)
+    }
+  }
+  return {
+    x: Math.round(left),
+    y: Math.round(top),
+    width: makeEven(right - left),
+    height: makeEven(bottom - top),
+  }
+}
+
+function cropForAspect(sourceWidth: number, sourceHeight: number, aspect: number) {
+  const sourceAspect = sourceWidth / Math.max(1, sourceHeight)
+  if (sourceAspect > aspect) {
+    const width = makeEven(sourceHeight * aspect)
+    return clampCrop({ x: Math.round((sourceWidth - width) / 2), y: 0, width, height: sourceHeight }, sourceWidth, sourceHeight)
+  }
+  const height = makeEven(sourceWidth / aspect)
+  return clampCrop({ x: 0, y: Math.round((sourceHeight - height) / 2), width: sourceWidth, height }, sourceWidth, sourceHeight)
 }
 
 function makeEven(value: number) {

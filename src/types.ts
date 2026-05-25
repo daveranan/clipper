@@ -3,7 +3,7 @@ export type AppSettings = {
   ffmpegPath: string
   frameRate: number
   maxMegabytes: number
-  qualityLengthCapEnabled: boolean
+  sizeCapEnabled: boolean
   qualityTargetKbps: number
   exportEncoderKey: string
   exportBitrateScale: number

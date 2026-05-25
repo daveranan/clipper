@@ -52,10 +52,47 @@ jobs:
         run: npm ci
 
       - name: Build signed app and updater artifacts
+        shell: pwsh
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build
+          TAURI_SIGNING_PRIVATE_KEY_RAW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD_RAW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $privateKey = $env:TAURI_SIGNING_PRIVATE_KEY_RAW
+          if ([string]::IsNullOrWhiteSpace($privateKey)) {
+            throw "Missing GitHub secret TAURI_SIGNING_PRIVATE_KEY."
+          }
+
+          $privateKey = $privateKey -replace '\\r\\n', "`n" -replace '\\n', "`n"
+          $privateKey = $privateKey.Trim().Trim('"').Trim("'").Trim()
+
+          if ($privateKey.Contains("`n")) {
+            $candidate = $privateKey -split '\r?\n' |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { $_ -match '^[A-Za-z0-9+/=]{80,}$' } |
+              Select-Object -First 1
+
+            if ($candidate) {
+              $privateKey = $candidate
+            }
+          }
+
+          if ($privateKey -notmatch '^[A-Za-z0-9+/=]+$') {
+            throw "TAURI_SIGNING_PRIVATE_KEY must be the base64 private key body from src-tauri/tauri-updater.key, not the public key, a file path, or a comment-prefixed minisign block."
+          }
+
+          $env:TAURI_SIGNING_PRIVATE_KEY = $privateKey
+          $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = if ($null -eq $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD_RAW) { "" } else { $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD_RAW.Trim() }
+
+          $signTest = Join-Path $env:RUNNER_TEMP "tauri-signing-test.txt"
+          Set-Content -Path $signTest -Value "test" -NoNewline
+          npx tauri signer sign $signTest | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tauri signing key validation failed. Recreate TAURI_SIGNING_PRIVATE_KEY from src-tauri/tauri-updater.key and TAURI_SIGNING_PRIVATE_KEY_PASSWORD from src-tauri/tauri-updater.password."
+          }
+
+          npm run tauri build
 
       - name: Create updater manifest
         shell: pwsh

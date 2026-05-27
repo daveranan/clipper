@@ -83,7 +83,7 @@ impl Default for AppSettings {
             encoder_benchmarks: Vec::new(),
             include_audio: true,
             audio_device_name: String::new(),
-            start_with_windows: false,
+            start_with_windows: true,
             record_hotkey: "Super+Shift+R".to_string(),
             reset_hotkey: "Super+Shift+4".to_string(),
             github_repository_url: "https://github.com/daveranan/clipper".to_string(),
@@ -558,6 +558,7 @@ Add-Type -AssemblyName System.Drawing
 $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $script:start = $null
 $script:current = $null
+$script:lastRect = $null
 $script:result = $null
 $form = New-Object System.Windows.Forms.Form
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
@@ -566,9 +567,12 @@ $form.Bounds = $bounds
 $form.TopMost = $true
 $form.ShowInTaskbar = $false
 $form.BackColor = [System.Drawing.Color]::Black
-$form.Opacity = 0.35
+$form.Opacity = 0.42
 $form.Cursor = [System.Windows.Forms.Cursors]::Cross
 $form.KeyPreview = $true
+$bindingFlags = [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic
+$doubleBufferedProperty = $form.GetType().GetProperty('DoubleBuffered', $bindingFlags)
+if ($doubleBufferedProperty) { $doubleBufferedProperty.SetValue($form, $true, $null) }
 $form.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $script:result = 'cancel'; $form.Close() } })
 $form.Add_MouseDown({
   if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
@@ -579,12 +583,24 @@ $form.Add_MouseDown({
   if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
   $script:start = New-Object System.Drawing.Point -ArgumentList ($_.X + $bounds.Left), ($_.Y + $bounds.Top)
   $script:current = $script:start
+  $script:lastRect = $null
   $form.Invalidate()
 })
 $form.Add_MouseMove({
   if ($script:start -eq $null) { return }
+  $oldRect = $script:lastRect
   $script:current = New-Object System.Drawing.Point -ArgumentList ($_.X + $bounds.Left), ($_.Y + $bounds.Top)
-  $form.Invalidate()
+  $left = [Math]::Min($script:start.X, $script:current.X) - $bounds.Left
+  $top = [Math]::Min($script:start.Y, $script:current.Y) - $bounds.Top
+  $width = [Math]::Abs($script:current.X - $script:start.X)
+  $height = [Math]::Abs($script:current.Y - $script:start.Y)
+  $newRect = New-Object System.Drawing.Rectangle -ArgumentList ([int]$left - 4), ([int]$top - 4), ([int]$width + 8), ([int]$height + 8)
+  if ($oldRect -ne $null) {
+    $form.Invalidate([System.Drawing.Rectangle]::Union($oldRect, $newRect))
+  } else {
+    $form.Invalidate($newRect)
+  }
+  $script:lastRect = $newRect
 })
 $form.Add_MouseUp({
   if ($script:start -eq $null) { return }
@@ -609,7 +625,7 @@ $form.Add_Paint({
   $height = [Math]::Abs($script:current.Y - $script:start.Y)
   if ($width -le 0 -or $height -le 0) { return }
   $selection = New-Object System.Drawing.Rectangle -ArgumentList $left, $top, $width, $height
-  $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(70, 65, 214, 195))
+  $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(90, 83, 199, 255))
   $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 65, 214, 195), 2)
   $_.Graphics.FillRectangle($brush, $selection)
   $_.Graphics.DrawRectangle($pen, $selection)
@@ -648,12 +664,14 @@ if ($script:result -and $script:result -ne 'cancel') { Write-Output $script:resu
 }
 
 #[tauri::command]
-fn export_clip(request: ExportRequest) -> Result<ExportResult, String> {
-    export_with_encoder(
-        &request,
-        &request.settings.export_encoder_key,
-        &request.output_path,
-    )
+async fn export_clip(request: ExportRequest) -> Result<ExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let encoder_key = request.settings.export_encoder_key.clone();
+        let output_path = request.output_path.clone();
+        export_with_encoder(&request, &encoder_key, &output_path)
+    })
+    .await
+    .map_err(|error| format!("Export worker failed: {}", error))?
 }
 
 fn export_with_encoder(
@@ -988,7 +1006,13 @@ fn can_copy_source_export(
 }
 
 #[tauri::command]
-fn benchmark_encoders(request: ExportRequest) -> Result<Vec<BenchmarkResult>, String> {
+async fn benchmark_encoders(request: ExportRequest) -> Result<Vec<BenchmarkResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || benchmark_encoders_sync(request))
+        .await
+        .map_err(|error| format!("Benchmark worker failed: {}", error))?
+}
+
+fn benchmark_encoders_sync(request: ExportRequest) -> Result<Vec<BenchmarkResult>, String> {
     let mut results = Vec::new();
     let output = PathBuf::from(&request.output_path);
     let folder = output
@@ -1402,7 +1426,21 @@ fn sibling_tool(ffmpeg_path: &str, tool: &str) -> String {
 fn hidden_command(program: &str) -> Command {
     let mut command = Command::new(program);
     #[cfg(windows)]
-    command.creation_flags(0x08000000);
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
+        let program_name = Path::new(program)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let flags = if program_name.contains("ffmpeg") {
+            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
+        } else {
+            CREATE_NO_WINDOW
+        };
+        command.creation_flags(flags);
+    }
     command
 }
 

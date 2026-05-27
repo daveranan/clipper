@@ -60,7 +60,7 @@ const defaultSettings: AppSettings = {
   encoderBenchmarks: [],
   includeAudio: true,
   audioDeviceName: '',
-  startWithWindows: false,
+  startWithWindows: true,
   recordHotkey: 'Super+Shift+R',
   resetHotkey: 'Super+Shift+4',
   githubRepositoryUrl: 'https://github.com/daveranan/clipper',
@@ -182,7 +182,19 @@ function MainApp() {
     }
 
     Promise.all([tauriInvoke<AppSettings>('load_settings'), isEnabled().catch(() => false)])
-      .then(([loaded, startWithWindows]) => setSettings({ ...defaultSettings, ...loaded, startWithWindows }))
+      .then(async ([loaded, startWithWindowsEnabled]) => {
+        const nextSettings = { ...defaultSettings, ...loaded }
+        try {
+          if (nextSettings.startWithWindows && !startWithWindowsEnabled) {
+            await enable()
+          } else if (!nextSettings.startWithWindows && startWithWindowsEnabled) {
+            await disable()
+          }
+        } catch (error) {
+          setStatus(`Startup unavailable: ${shortError(error)}`)
+        }
+        setSettings(nextSettings)
+      })
       .catch((error) => setStatus(shortError(error)))
   }, [])
 
@@ -593,6 +605,7 @@ function MainApp() {
     setIsExporting(true)
     setStatus('Exporting')
     try {
+      await nextPaint()
       const outputPath = joinPath(settings.saveFolder, `clip-${dateStamp()}.mp4`)
       const request: ExportRequest = {
         inputPath: clip.path,
@@ -626,6 +639,7 @@ function MainApp() {
     setIsExporting(true)
     setStatus('Benchmarking encoders')
     try {
+      await nextPaint()
       const outputPath = await tauriInvoke<string | null>('choose_export_path', {
         saveFolder: settings.saveFolder,
         fileName: `benchmark-${dateStamp()}.mp4`,
@@ -2560,6 +2574,12 @@ function isInterruptedPlaybackError(error: unknown) {
 
 function canUseTauri() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
+function nextPaint() {
+  return new Promise<void>((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0))
+  })
 }
 
 function tauriInvoke<T = unknown>(command: string, args?: Record<string, unknown>) {

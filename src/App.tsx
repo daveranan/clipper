@@ -86,6 +86,7 @@ type TimelineDragState =
   | { mode: 'trim-start' | 'trim-end'; element: HTMLElement; track: TimelineTrack; timelineAnchor: number; sourceAnchor: number; timelineOffsetAnchor: number }
   | { mode: 'cut-start' | 'cut-end'; element: HTMLElement; cutIndex: number; track: TimelineTrack; timelineAnchor: number; sourceAnchor: number }
   | { mode: 'pan'; element: HTMLElement; startX: number; startTimelineStart: number }
+  | { mode: 'marquee'; element: HTMLElement; startX: number; startY: number; currentX: number; currentY: number }
 
 type TimelineDragInput =
   | { mode: 'seek' }
@@ -94,8 +95,10 @@ type TimelineDragInput =
   | { mode: 'pan'; startX: number; startTimelineStart: number }
 
 type TimelineTrack = 'video' | 'audio'
-type SelectedClip = { track: TimelineTrack; index: number } | null
+type ClipSelection = { track: TimelineTrack; index: number }
+type SelectedClip = ClipSelection | null
 type DisplayClip = CutRange & { sourceStart: number; sourceEnd: number }
+type MarqueeSelection = { startX: number; startY: number; currentX: number; currentY: number } | null
 type EditSnapshot = {
   trimStart: number
   trimEnd: number
@@ -154,6 +157,8 @@ function MainApp() {
   const [timelineOffset, setTimelineOffset] = useState(0)
   const [audioTimelineOffset, setAudioTimelineOffset] = useState(0)
   const [selectedClip, setSelectedClip] = useState<SelectedClip>(null)
+  const [selectedClips, setSelectedClips] = useState<ClipSelection[]>([])
+  const [marqueeSelection, setMarqueeSelection] = useState<MarqueeSelection>(null)
   const [isTimelinePanning, setIsTimelinePanning] = useState(false)
   const [isTimelinePreviewing, setIsTimelinePreviewing] = useState(false)
   const [isCScrubbing, setIsCScrubbing] = useState(false)
@@ -359,6 +364,16 @@ function MainApp() {
 
   const { canUndo, canRedo } = historyState
 
+  const clearClipSelection = () => {
+    setSelectedClip(null)
+    setSelectedClips([])
+  }
+
+  const selectClip = (selection: ClipSelection) => {
+    setSelectedClip(selection)
+    setSelectedClips([selection])
+  }
+
   const currentEditSnapshot = (): EditSnapshot => ({
     trimStart,
     trimEnd,
@@ -389,7 +404,7 @@ function MainApp() {
     setOutputHeight(snapshot.outputHeight)
     setAutoFit720(snapshot.autoFit720)
     setSettings((value) => ({ ...value, audioGainDb: snapshot.audioGainDb }))
-    setSelectedClip(null)
+    clearClipSelection()
     setPendingCutStart(null)
     if (clip) {
       setCurrentTime((value) => clamp(value, snapshot.trimStart, snapshot.trimEnd))
@@ -467,7 +482,7 @@ function MainApp() {
       setCuts([])
       setAudioCuts([])
       setPendingCutStart(null)
-      setSelectedClip(null)
+      clearClipSelection()
       setCrop({ x: 0, y: 0, width: nextClip.width, height: nextClip.height })
       setOutputWidth(makeEven(nextClip.width))
       setOutputHeight(makeEven(nextClip.height))
@@ -826,6 +841,31 @@ function MainApp() {
     }
   }
 
+  const snapTimelineTime = (value: number) => {
+    if (!snappingEnabled || !clip) {
+      return value
+    }
+    const threshold = Math.max(1 / Math.max(1, settings.frameRate), timelineViewport.span / 180)
+    const candidates = [
+      ...videoClipSegments.flatMap((segment) => [segment.start, segment.end]),
+      ...audioClipSegments.flatMap((segment) => [segment.start, segment.end]),
+    ]
+    let best = value
+    let bestDistance = threshold
+    for (const candidate of candidates) {
+      const distance = Math.abs(candidate - value)
+      if (distance <= bestDistance) {
+        best = candidate
+        bestDistance = distance
+      }
+    }
+    return best
+  }
+
+  const seekTimeline = (timelineSeconds: number, exact = false) => {
+    seek(timelineToSourceTime(snapTimelineTime(timelineSeconds), videoClipSegments), exact)
+  }
+
   const stepFrame = (direction: -1 | 1, exact = true) => {
     if (!clip || videoClipSegments.length === 0) {
       return
@@ -891,7 +931,7 @@ function MainApp() {
     } else {
       setCuts((current) => mergeCuts([...current, { start, end }]))
     }
-    setSelectedClip(null)
+    clearClipSelection()
     finishEdit()
     setStatus(`Cut ${formatTime(start)} to ${formatTime(end)}`)
   }
@@ -914,30 +954,40 @@ function MainApp() {
     } else {
       setCuts((current) => current.filter((_, index) => index !== nearest.index))
     }
-    setSelectedClip(null)
+    clearClipSelection()
     finishEdit()
   }
 
   const deleteSelectedClip = () => {
-    if (!selectedClip) {
+    const selections = selectedClips.length > 0 ? uniqueClipSelections(selectedClips) : selectedClip ? [selectedClip] : []
+    if (selections.length === 0) {
       return
     }
-    const segments = selectedClip.track === 'audio' ? audioClipSegments : videoClipSegments
-    const segment = segments[selectedClip.index]
-    if (!segment) {
+    const videoRanges = selections
+      .filter((selection) => selection.track === 'video')
+      .map((selection) => videoClipSegments[selection.index])
+      .filter(Boolean)
+      .map((segment) => ({ start: segment.sourceStart, end: segment.sourceEnd }))
+    const audioRanges = selections
+      .filter((selection) => selection.track === 'audio')
+      .map((selection) => audioClipSegments[selection.index])
+      .filter(Boolean)
+      .map((segment) => ({ start: segment.sourceStart, end: segment.sourceEnd }))
+    if (videoRanges.length === 0 && audioRanges.length === 0) {
       return
     }
-    beginEdit(selectedClip.track === 'audio' ? 'Remove audio clip' : 'Remove video clip')
-    if (selectedClip.track === 'audio') {
-      setAudioCuts((current) => mergeCuts([...current, { start: segment.sourceStart, end: segment.sourceEnd }]))
-      setSyncLinked(false)
-    } else {
-      setCuts((current) => mergeCuts([...current, { start: segment.sourceStart, end: segment.sourceEnd }]))
+    beginEdit(selections.length > 1 ? 'Remove selected clips' : selections[0].track === 'audio' ? 'Remove audio clip' : 'Remove video clip')
+    if (videoRanges.length > 0) {
+      setCuts((current) => mergeCuts([...current, ...videoRanges]))
       if (syncLinked) {
-        setAudioCuts((current) => mergeCuts([...current, { start: segment.sourceStart, end: segment.sourceEnd }]))
+        setAudioCuts((current) => mergeCuts([...current, ...videoRanges]))
       }
     }
-    setSelectedClip(null)
+    if (audioRanges.length > 0) {
+      setAudioCuts((current) => mergeCuts([...current, ...audioRanges]))
+      setSyncLinked(false)
+    }
+    clearClipSelection()
     finishEdit()
   }
 
@@ -945,14 +995,32 @@ function MainApp() {
     if (!clip) {
       return
     }
-    const nextEnd = Math.min(clip.durationSeconds, trimStart + qualityMaxSeconds)
+    const capSeconds = Math.max(1 / Math.max(1, settings.frameRate), Math.min(qualityMaxSeconds, clip.durationSeconds))
+    const nextEnd = keptSeconds > capSeconds
+      ? sourceEndForKeptDuration(videoClipSegments, capSeconds)
+      : trimEnd
+    const nextAudioEnd = audioKeptSeconds > capSeconds
+      ? sourceEndForKeptDuration(audioClipSegments, capSeconds)
+      : audioTrimEnd
+    if (keptSeconds <= capSeconds && (!syncLinked || audioKeptSeconds <= capSeconds)) {
+      setStatus('Already under max length')
+      return
+    }
     beginEdit('Length limit')
-    setTrimEnd(nextEnd)
+    if (keptSeconds > capSeconds) {
+      setTrimEnd(nextEnd)
+    }
     if (syncLinked) {
       setAudioTrimEnd(nextEnd)
+    } else if (audioKeptSeconds > capSeconds) {
+      setAudioTrimEnd(nextAudioEnd)
     }
-    setCurrentTime((value) => Math.min(value, nextEnd))
+    const nextTime = normalizePlayableSourceTime(Math.min(currentTimeRef.current, nextEnd), cuts, trimStart, nextEnd)
+    currentTimeRef.current = nextTime
+    setCurrentTime(nextTime)
     finishEdit()
+    setStatus(`Max length applied at ${formatTime(capSeconds)}`)
+    void showExactFrame(nextTime)
   }
 
   const resetClipEdits = () => {
@@ -973,7 +1041,7 @@ function MainApp() {
     setCuts([])
     setAudioCuts([])
     setPendingCutStart(null)
-    setSelectedClip(null)
+    clearClipSelection()
     setCrop({ x: 0, y: 0, width: clip.width, height: clip.height })
     setOutputWidth(makeEven(clip.width))
     setOutputHeight(makeEven(clip.height))
@@ -1163,7 +1231,7 @@ function MainApp() {
       exactFrameAfterDragRef.current = true
       return
     }
-    seek(timelineToSourceTime(secondsAt, videoClipSegments))
+    seekTimeline(secondsAt)
   }
 
   const snapSourceTime = (value: number, track: TimelineTrack) => {
@@ -1206,7 +1274,7 @@ function MainApp() {
       if (!clip || !surface || !cScrubModeRef.current || settingsOpen) {
         return
       }
-      seek(timelineToSourceTime(secondsFromTimelinePointer(surface, event.clientX), videoClipSegments))
+      seekTimeline(secondsFromTimelinePointer(surface, event.clientX))
     }
     const onBlur = () => {
       cScrubModeRef.current = false
@@ -1224,7 +1292,7 @@ function MainApp() {
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as HTMLElement | null
       if (!target?.closest('.timeline-clip')) {
-        setSelectedClip(null)
+        clearClipSelection()
       }
     }
     window.addEventListener('pointerdown', onPointerDown)
@@ -1290,6 +1358,54 @@ function MainApp() {
     return frames.filter((_, index) => index % step === 0).slice(0, desired)
   }
 
+  const selectClipsInMarquee = (element: HTMLElement, selection: NonNullable<MarqueeSelection>) => {
+    const rect = element.getBoundingClientRect()
+    const left = Math.min(selection.startX, selection.currentX)
+    const right = Math.max(selection.startX, selection.currentX)
+    const top = Math.min(selection.startY, selection.currentY)
+    const bottom = Math.max(selection.startY, selection.currentY)
+    const selections: ClipSelection[] = []
+
+    const collect = (track: TimelineTrack, segments: DisplayClip[]) => {
+      const trackElement = element.querySelector<HTMLElement>(track === 'video' ? '.video-track' : '.audio-track')
+      if (!trackElement) {
+        return
+      }
+      const trackRect = trackElement.getBoundingClientRect()
+      const trackTop = trackRect.top - rect.top
+      const trackBottom = trackRect.bottom - rect.top
+      if (bottom < trackTop || top > trackBottom) {
+        return
+      }
+      segments.forEach((segment, index) => {
+        const segmentLeft = ((segment.start - timelineViewport.start) / Math.max(0.001, timelineViewport.span)) * rect.width
+        const segmentRight = ((segment.end - timelineViewport.start) / Math.max(0.001, timelineViewport.span)) * rect.width
+        if (segmentRight >= left && segmentLeft <= right) {
+          selections.push({ track, index })
+        }
+      })
+    }
+
+    collect('video', videoClipSegments)
+    collect('audio', audioClipSegments)
+    return uniqueClipSelections(selections)
+  }
+
+  const updateMarqueeSelection = (drag: Extract<TimelineDragState, { mode: 'marquee' }>, clientX: number, clientY: number) => {
+    const rect = drag.element.getBoundingClientRect()
+    const nextSelection = {
+      startX: drag.startX,
+      startY: drag.startY,
+      currentX: clamp(clientX - rect.left, 0, rect.width),
+      currentY: clamp(clientY - rect.top, 0, rect.height),
+    }
+    timelineDragRef.current = { ...drag, currentX: nextSelection.currentX, currentY: nextSelection.currentY }
+    setMarqueeSelection(nextSelection)
+    const nextClips = selectClipsInMarquee(drag.element, nextSelection)
+    setSelectedClips(nextClips)
+    setSelectedClip(nextClips[0] ?? null)
+  }
+
   const beginTimelineDrag = (event: ReactPointerEvent<HTMLElement>, drag: TimelineDragInput) => {
     const element = timelineSurfaceRef.current
     if (!element) {
@@ -1331,6 +1447,12 @@ function MainApp() {
   }
 
   const isClipSelected = (track: TimelineTrack, index: number) => {
+    if (selectedClips.some((selection) => selection.track === track && selection.index === index)) {
+      return true
+    }
+    if (syncLinked && selectedClips.some((selection) => selection.index === index)) {
+      return true
+    }
     if (!selectedClip || selectedClip.index !== index) {
       return false
     }
@@ -1507,7 +1629,7 @@ function MainApp() {
             <Button variant="subtle" disabled={!clip || (selectedClip?.track === 'audio' ? audioCuts.length === 0 : cuts.length === 0)} onClick={removeCut}>
               Remove Cut
             </Button>
-            <Button variant="subtle" disabled={!selectedClip} onClick={deleteSelectedClip}>
+            <Button variant="subtle" disabled={!selectedClip && selectedClips.length === 0} onClick={deleteSelectedClip}>
               <Trash2 />
               Delete Clip
             </Button>
@@ -1646,7 +1768,19 @@ function MainApp() {
                 return
               }
               if (event.button === 0 && !cScrubModeRef.current) {
-                setSelectedClip(null)
+                const target = event.target as HTMLElement | null
+                if (target?.closest('.timeline-clip') || target?.closest('.ruler')) {
+                  return
+                }
+                const rect = event.currentTarget.getBoundingClientRect()
+                const startX = clamp(event.clientX - rect.left, 0, rect.width)
+                const startY = clamp(event.clientY - rect.top, 0, rect.height)
+                const selection = { startX, startY, currentX: startX, currentY: startY }
+                clearClipSelection()
+                setMarqueeSelection(selection)
+                timelineDragRef.current = { mode: 'marquee', element: event.currentTarget, ...selection }
+                event.currentTarget.setPointerCapture(event.pointerId)
+                return
               }
               if (event.button === 0 && cScrubModeRef.current) {
                 timelineDragRef.current = { mode: 'seek', element: event.currentTarget }
@@ -1659,6 +1793,10 @@ function MainApp() {
               if (!clip || !drag) {
                 return
               }
+              if (drag.mode === 'marquee') {
+                updateMarqueeSelection(drag, event.clientX, event.clientY)
+                return
+              }
               if (drag.mode === 'pan') {
                 const deltaSeconds = ((drag.startX - event.clientX) / Math.max(1, drag.element.getBoundingClientRect().width)) * timelineViewport.span
                 setTimelineStart(clamp(drag.startTimelineStart + deltaSeconds, 0, Math.max(0, timelineViewport.duration - timelineViewport.span)))
@@ -1667,7 +1805,12 @@ function MainApp() {
               applyTimelineDrag(drag.element, event.clientX)
             }}
             onPointerUp={(event) => {
+              const drag = timelineDragRef.current
+              if (drag?.mode === 'marquee') {
+                updateMarqueeSelection(drag, event.clientX, event.clientY)
+              }
               timelineDragRef.current = null
+              setMarqueeSelection(null)
               setIsTimelinePanning(false)
               setIsTimelinePreviewing(false)
               finishEdit()
@@ -1681,6 +1824,7 @@ function MainApp() {
             }}
             onPointerCancel={(event) => {
               timelineDragRef.current = null
+              setMarqueeSelection(null)
               setIsTimelinePanning(false)
               setIsTimelinePreviewing(false)
               exactFrameAfterDragRef.current = false
@@ -1717,7 +1861,7 @@ function MainApp() {
                   return
                 }
                 beginTimelineDrag(event, { mode: 'seek' })
-                seek(timelineToSourceTime(secondsFromTimelinePointer(event.currentTarget, event.clientX), videoClipSegments))
+                seekTimeline(secondsFromTimelinePointer(event.currentTarget, event.clientX))
               }}
             >
               {Array.from({ length: 12 }, (_, index) => (
@@ -1735,11 +1879,11 @@ function MainApp() {
                       return
                     }
                     if (cScrubModeRef.current && timelineSurfaceRef.current) {
-                      seek(timelineToSourceTime(secondsFromTimelinePointer(timelineSurfaceRef.current, event.clientX), videoClipSegments))
+                      seekTimeline(secondsFromTimelinePointer(timelineSurfaceRef.current, event.clientX))
                       return
                     }
                     event.stopPropagation()
-                    setSelectedClip({ track: 'video', index })
+                    selectClip({ track: 'video', index })
                   }}
                   style={timelineRangeStyle(segment.start, segment.end, timelineViewport)}
                 >
@@ -1762,11 +1906,11 @@ function MainApp() {
                       return
                     }
                     if (cScrubModeRef.current && timelineSurfaceRef.current) {
-                      seek(timelineToSourceTime(secondsFromTimelinePointer(timelineSurfaceRef.current, event.clientX), videoClipSegments))
+                      seekTimeline(secondsFromTimelinePointer(timelineSurfaceRef.current, event.clientX))
                       return
                     }
                     event.stopPropagation()
-                    setSelectedClip({ track: 'audio', index })
+                    selectClip({ track: 'audio', index })
                   }}
                   style={timelineRangeStyle(segment.start, segment.end, timelineViewport)}
                 >
@@ -1793,6 +1937,9 @@ function MainApp() {
                   timelineViewport,
                 )}
               />
+            )}
+            {marqueeSelection && (
+              <div className="selection-marquee" style={marqueeSelectionStyle(marqueeSelection)} />
             )}
           </div>
         </div>
@@ -2424,6 +2571,44 @@ function timelineClipBounds(clips: DisplayClip[]) {
   return {
     start: clips[0].start,
     end: clips[clips.length - 1].end,
+  }
+}
+
+function sourceEndForKeptDuration(clips: DisplayClip[], maxSeconds: number) {
+  if (clips.length === 0) {
+    return 0
+  }
+  let remaining = Math.max(0, maxSeconds)
+  for (const clip of clips) {
+    const length = Math.max(0, clip.end - clip.start)
+    if (remaining <= length) {
+      return clip.sourceStart + remaining
+    }
+    remaining -= length
+  }
+  return clips[clips.length - 1].sourceEnd
+}
+
+function uniqueClipSelections(selections: ClipSelection[]) {
+  const seen = new Set<string>()
+  return selections.filter((selection) => {
+    const key = `${selection.track}:${selection.index}`
+    if (seen.has(key)) {
+      return false
+    }
+    seen.add(key)
+    return true
+  })
+}
+
+function marqueeSelectionStyle(selection: NonNullable<MarqueeSelection>) {
+  const left = Math.min(selection.startX, selection.currentX)
+  const top = Math.min(selection.startY, selection.currentY)
+  return {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${Math.abs(selection.currentX - selection.startX)}px`,
+    height: `${Math.abs(selection.currentY - selection.startY)}px`,
   }
 }
 

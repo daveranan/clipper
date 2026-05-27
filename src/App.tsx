@@ -61,6 +61,7 @@ const defaultSettings: AppSettings = {
   includeAudio: true,
   audioDeviceName: '',
   startWithWindows: true,
+  startHiddenInTray: true,
   recordHotkey: 'Super+Shift+R',
   resetHotkey: 'Super+Shift+4',
   githubRepositoryUrl: 'https://github.com/daveranan/clipper',
@@ -185,7 +186,10 @@ function MainApp() {
       .then(async ([loaded, startWithWindowsEnabled]) => {
         const nextSettings = { ...defaultSettings, ...loaded }
         try {
-          if (nextSettings.startWithWindows && !startWithWindowsEnabled) {
+          if (nextSettings.startWithWindows) {
+            if (startWithWindowsEnabled) {
+              await disable()
+            }
             await enable()
           } else if (!nextSettings.startWithWindows && startWithWindowsEnabled) {
             await disable()
@@ -555,6 +559,7 @@ function MainApp() {
   const saveSettings = async () => {
     try {
       if (settings.startWithWindows) {
+        await disable()
         await enable()
       } else {
         await disable()
@@ -1891,6 +1896,15 @@ function MainApp() {
                   onChange={(event) => setSettings((value) => ({ ...value, startWithWindows: event.target.checked }))}
                 />
                 Start with Windows
+              </label>
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={settings.startHiddenInTray}
+                  disabled={!settings.startWithWindows}
+                  onChange={(event) => setSettings((value) => ({ ...value, startHiddenInTray: event.target.checked }))}
+                />
+                Start hidden in tray
               </label>
             </div>
             <div className="modal-actions">

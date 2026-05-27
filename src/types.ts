@@ -13,6 +13,7 @@ export type AppSettings = {
   includeAudio: boolean
   audioDeviceName: string
   startWithWindows: boolean
+  startHiddenInTray: boolean
   recordHotkey: string
   resetHotkey: string
   githubRepositoryUrl: string

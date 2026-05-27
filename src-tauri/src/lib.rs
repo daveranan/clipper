@@ -56,6 +56,8 @@ pub struct AppSettings {
     include_audio: bool,
     audio_device_name: String,
     start_with_windows: bool,
+    #[serde(default = "default_true")]
+    start_hidden_in_tray: bool,
     record_hotkey: String,
     reset_hotkey: String,
     github_repository_url: String,
@@ -84,6 +86,7 @@ impl Default for AppSettings {
             include_audio: true,
             audio_device_name: String::new(),
             start_with_windows: true,
+            start_hidden_in_tray: true,
             record_hotkey: "Super+Shift+R".to_string(),
             reset_hotkey: "Super+Shift+4".to_string(),
             github_repository_url: "https://github.com/daveranan/clipper".to_string(),
@@ -2177,6 +2180,15 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn should_start_hidden_in_tray() -> bool {
+    if !std::env::args().any(|arg| arg == "--quickclipper-startup") {
+        return false;
+    }
+    load_settings()
+        .map(|settings| settings.start_hidden_in_tray)
+        .unwrap_or(true)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2188,6 +2200,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_autostart::Builder::new()
                 .app_name("QuickClipper")
+                .args(["--quickclipper-startup"])
                 .build(),
         )
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -2195,6 +2208,11 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             create_tray(app)?;
+            if should_start_hidden_in_tray() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

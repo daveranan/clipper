@@ -160,7 +160,7 @@ function MainApp() {
   const [selectedClips, setSelectedClips] = useState<ClipSelection[]>([])
   const [marqueeSelection, setMarqueeSelection] = useState<MarqueeSelection>(null)
   const [isTimelinePanning, setIsTimelinePanning] = useState(false)
-  const [isTimelinePreviewing, setIsTimelinePreviewing] = useState(false)
+  const [, setIsTimelinePreviewing] = useState(false)
   const [isCScrubbing, setIsCScrubbing] = useState(false)
   const [snappingEnabled, setSnappingEnabled] = useState(true)
   const [syncLinked, setSyncLinked] = useState(true)
@@ -283,7 +283,7 @@ function MainApp() {
   }, [clip, cuts, isPlaying, trimEnd])
 
   const previewSrc = useMemo(() => {
-    if ((isPlaying || isTimelinePreviewing) && !exactFrame) {
+    if ((isPlaying || isCScrubbing) && !exactFrame) {
       return null
     }
     if (exactFrame) {
@@ -297,7 +297,7 @@ function MainApp() {
       return convertFileSrc(preview.frames[preview.frames.length - 1])
     }
     return convertFileSrc(preview.frames[index])
-  }, [currentTime, exactFrame, isPlaying, isTimelinePreviewing, preview])
+  }, [currentTime, exactFrame, isCScrubbing, isPlaying, preview])
   const clipMediaSrc = useMemo(() => (playbackPath ? convertFileSrc(playbackPath) : null), [playbackPath])
 
   useEffect(() => {
@@ -463,6 +463,11 @@ function MainApp() {
     setStatus('Redo')
   }
 
+  const clearExactFrame = () => {
+    frameRequestRef.current += 1
+    setExactFrame(null)
+  }
+
   const loadClip = useCallback(
     async (nextClip: VideoInfo) => {
       frameRequestRef.current += 1
@@ -551,7 +556,9 @@ function MainApp() {
           setExactFrame(path)
         }
       } catch (error) {
-        setStatus(shortError(error))
+        if (requestId === frameRequestRef.current) {
+          setStatus(shortError(error))
+        }
       }
     },
     [clip, settings],
@@ -819,12 +826,13 @@ function MainApp() {
     const next = normalizePlayableSourceTime(value, cuts, trimStart, trimEnd)
     currentTimeRef.current = next
     setCurrentTime(next)
-    setExactFrame(null)
     if (playbackRef.current) {
       playbackRef.current.currentTime = next
     }
     if (exact) {
       void showExactFrame(next)
+    } else {
+      clearExactFrame()
     }
   }
 
@@ -832,12 +840,13 @@ function MainApp() {
     const next = clamp(value, 0, Math.max(clip?.durationSeconds ?? 0, 0))
     currentTimeRef.current = next
     setCurrentTime(next)
-    setExactFrame(null)
     if (playbackRef.current) {
       playbackRef.current.currentTime = next
     }
     if (exact) {
       void showExactFrame(next)
+    } else {
+      clearExactFrame()
     }
   }
 
@@ -901,7 +910,7 @@ function MainApp() {
         seek(normalized)
       }
     }
-    setExactFrame(null)
+    clearExactFrame()
     setIsPlaying(true)
   }
 
@@ -1031,7 +1040,7 @@ function MainApp() {
     setIsPlaying(false)
     currentTimeRef.current = 0
     setCurrentTime(0)
-    setExactFrame(null)
+    clearExactFrame()
     setTrimStart(0)
     setTrimEnd(clip.durationSeconds)
     setTimelineOffset(0)
@@ -1098,12 +1107,12 @@ function MainApp() {
       }
       if (event.key === 'ArrowLeft') {
         event.preventDefault()
-        stepFrame(-1, false)
+        stepFrame(-1, !event.repeat)
         return
       }
       if (event.key === 'ArrowRight') {
         event.preventDefault()
-        stepFrame(1, false)
+        stepFrame(1, !event.repeat)
         return
       }
       if (event.key === 'Delete' || event.key === 'Backspace') {
@@ -1595,7 +1604,7 @@ function MainApp() {
           <div className="viewer">
             {clipMediaSrc && (
               <video
-                className={isPlaying || isCScrubbing || isTimelinePreviewing || !previewSrc ? 'viewer-video active' : 'viewer-video'}
+                className={isPlaying || isCScrubbing || !previewSrc ? 'viewer-video active' : 'viewer-video'}
                 ref={playbackRef}
                 src={clipMediaSrc}
                 preload="auto"
@@ -1603,7 +1612,7 @@ function MainApp() {
               />
             )}
             {previewSrc ? (
-              <img className={isPlaying || isCScrubbing || isTimelinePreviewing ? 'viewer-still hidden' : 'viewer-still'} src={previewSrc} alt="" />
+              <img className={isPlaying || isCScrubbing ? 'viewer-still hidden' : 'viewer-still'} src={previewSrc} alt="" />
             ) : (
               <div className={clipMediaSrc ? 'empty-viewer hidden' : 'empty-viewer'}>
                 <Film className="size-12" />

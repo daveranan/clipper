@@ -141,7 +141,7 @@ textarea {
 .has-tooltip:hover::after {
   position: absolute;
   right: 0;
-  bottom: calc(100% + 8px);
+  top: calc(100% + 8px);
   z-index: 80;
   width: 310px;
   border: 1px solid #343a45;

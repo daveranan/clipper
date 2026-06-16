@@ -10,6 +10,7 @@ export type AppSettings = {
   audioGainDb: number
   unsupportedEncoderKeys: string[]
   encoderBenchmarks: EncoderBenchmark[]
+  includeVideo: boolean
   includeAudio: boolean
   audioDeviceName: string
   startWithWindows: boolean

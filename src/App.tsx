@@ -58,6 +58,7 @@ const defaultSettings: AppSettings = {
   audioGainDb: 0,
   unsupportedEncoderKeys: [],
   encoderBenchmarks: [],
+  includeVideo: true,
   includeAudio: true,
   audioDeviceName: '',
   startWithWindows: true,
@@ -310,12 +311,12 @@ function MainApp() {
   }, [clipMediaSrc])
 
   const qualityMaxSeconds = useMemo(() => {
-    const audioKbps = settings.includeAudio ? 96 : 0
+    const audioKbps = settings.includeAudio ? (settings.includeVideo ? 96 : 2304) : 0
     const pixels = Math.max(1, outputWidth * outputHeight)
     const scale = pixels / (1920 * 1080)
-    const videoKbps = Math.max(1200, Math.min(settings.qualityTargetKbps, Math.round(settings.qualityTargetKbps * scale)))
+    const videoKbps = settings.includeVideo ? Math.max(1200, Math.min(settings.qualityTargetKbps, Math.round(settings.qualityTargetKbps * scale))) : 0
     return (settings.maxMegabytes * 8192 * 0.985) / Math.max(1, videoKbps + audioKbps)
-  }, [outputHeight, outputWidth, settings.includeAudio, settings.maxMegabytes, settings.qualityTargetKbps])
+  }, [outputHeight, outputWidth, settings.includeAudio, settings.includeVideo, settings.maxMegabytes, settings.qualityTargetKbps])
 
   const timelineViewport = useMemo(() => {
     const duration = timelineDurationFor(clip?.durationSeconds || 1, keptSeconds, timelineOffset, audioKeptSeconds, audioTimelineOffset)
@@ -633,7 +634,8 @@ function MainApp() {
     setStatus('Exporting')
     try {
       await nextPaint()
-      const outputPath = joinPath(settings.saveFolder, `clip-${dateStamp()}.mp4`)
+      const extension = settings.includeVideo ? 'mp4' : 'wav'
+      const outputPath = joinPath(settings.saveFolder, `clip-${dateStamp()}.${extension}`)
       const request: ExportRequest = {
         inputPath: clip.path,
         outputPath,
@@ -1504,14 +1506,30 @@ function MainApp() {
           <label className="top-toggle">
             <input
               type="checkbox"
+              checked={settings.includeVideo}
+              onChange={(event) => setSettings((value) => ({
+                ...value,
+                includeVideo: event.target.checked,
+                includeAudio: event.target.checked ? value.includeAudio : true,
+              }))}
+            />
+            Video
+          </label>
+          <label className="top-toggle">
+            <input
+              type="checkbox"
               checked={settings.includeAudio}
-              onChange={(event) => setSettings((value) => ({ ...value, includeAudio: event.target.checked }))}
+              onChange={(event) => setSettings((value) => ({
+                ...value,
+                includeAudio: event.target.checked,
+                includeVideo: event.target.checked ? value.includeVideo : true,
+              }))}
             />
             Audio
           </label>
           <label
             className="top-toggle has-tooltip"
-            data-tooltip={`Size Cap targets ${settings.maxMegabytes.toFixed(1)} MB by adjusting export bitrate and retrying up to 5 times. Turn it off to preserve source quality instead of shrinking the file.`}
+            data-tooltip={`Size Cap targets ${settings.maxMegabytes.toFixed(1)} MB by adjusting export bitrate and retrying up to 5 times. Audio-only WAV uses the highest PCM profile that fits. Turn it off to preserve source quality.`}
             title="Target a maximum exported file size."
           >
             <input
@@ -1523,7 +1541,7 @@ function MainApp() {
           </label>
           <Button variant="primary" disabled={!clip || isExporting} onClick={exportClip}>
             <Upload />
-            {isExporting ? 'Exporting' : 'Export'}
+            {isExporting ? 'Exporting' : settings.includeVideo ? 'Export' : 'Export WAV'}
           </Button>
           <Button size="icon" variant="subtle" disabled={!lastExport} onClick={copyLastExport} title="Copy exported file to clipboard">
             <Clipboard />
@@ -1706,7 +1724,7 @@ function MainApp() {
                 <Settings2 />
                 Save Settings
               </Button>
-              <Button className="w-full" variant="subtle" disabled={!clip || isExporting} onClick={benchmarkEncoders}>
+              <Button className="w-full" variant="subtle" disabled={!clip || isExporting || !settings.includeVideo} onClick={benchmarkEncoders}>
                 <Gauge />
                 Benchmark Encoders
               </Button>

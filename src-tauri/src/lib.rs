@@ -53,6 +53,8 @@ pub struct AppSettings {
     audio_gain_db: f64,
     unsupported_encoder_keys: Vec<String>,
     encoder_benchmarks: Vec<EncoderBenchmark>,
+    #[serde(default = "default_true")]
+    include_video: bool,
     include_audio: bool,
     audio_device_name: String,
     start_with_windows: bool,
@@ -83,6 +85,7 @@ impl Default for AppSettings {
             audio_gain_db: 0.0,
             unsupported_encoder_keys: Vec::new(),
             encoder_benchmarks: Vec::new(),
+            include_video: true,
             include_audio: true,
             audio_device_name: String::new(),
             start_with_windows: true,
@@ -199,6 +202,14 @@ pub struct BenchmarkResult {
 struct ExportAttemptResult {
     path: PathBuf,
     bytes: u64,
+    kbps: u32,
+}
+
+#[derive(Clone, Copy)]
+struct AudioWavProfile {
+    codec: &'static str,
+    sample_rate: u32,
+    channels: u32,
     kbps: u32,
 }
 
@@ -684,6 +695,15 @@ fn export_with_encoder(
 ) -> Result<ExportResult, String> {
     let started = Instant::now();
     ensure_parent(Path::new(output_path))?;
+    if !request.settings.include_video {
+        let bytes = export_audio_only(request, Path::new(output_path))?;
+        return Ok(ExportResult {
+            path: output_path.to_string(),
+            bytes,
+            seconds: started.elapsed().as_secs_f64(),
+        });
+    }
+
     let duration = kept_duration(request.start, request.end, &request.cuts);
     if duration <= 0.01 {
         return Err("Trim range is empty.".to_string());
@@ -747,6 +767,126 @@ fn export_with_encoder(
         bytes,
         seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+fn export_audio_only(request: &ExportRequest, output_path: &Path) -> Result<u64, String> {
+    if !request.settings.include_audio {
+        return Err("Audio-only export needs Audio enabled.".to_string());
+    }
+    let source_path = Path::new(&request.input_path);
+    if !source_has_audio(&request.settings, source_path) {
+        return Err("Source has no audio stream.".to_string());
+    }
+    let audio_kept = kept_segments(request.audio_start, request.audio_end, &request.audio_cuts);
+    let duration: f64 = audio_kept
+        .iter()
+        .map(|(start, end)| end - start)
+        .sum();
+    if duration <= 0.01 {
+        return Err("Audio trim range is empty.".to_string());
+    }
+
+    let profile = choose_audio_wav_profile(&request.settings, duration);
+    let args = build_audio_only_export_args(request, output_path, &audio_kept, profile, duration);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Err(error) = run_command(&request.settings.ffmpeg_path, &arg_refs, "Audio export failed") {
+        remove_empty_file(output_path);
+        return Err(error);
+    }
+    let bytes = fs::metadata(output_path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| error.to_string())?;
+    if request.settings.size_cap_enabled && bytes > target_size_bytes(request.settings.max_megabytes) {
+        let _ = fs::remove_file(output_path);
+        return Err(format!(
+            "Audio WAV exceeds {:.1} MB. Trim audio or raise Max MB.",
+            request.settings.max_megabytes
+        ));
+    }
+    Ok(bytes)
+}
+
+fn build_audio_only_export_args(
+    request: &ExportRequest,
+    output_path: &Path,
+    audio_kept: &[(f64, f64)],
+    profile: AudioWavProfile,
+    duration: f64,
+) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-y".to_string(),
+        "-i".to_string(),
+        request.input_path.clone(),
+    ];
+    if request.audio_cuts.is_empty() {
+        args.extend([
+            "-ss".to_string(),
+            seconds(request.audio_start),
+            "-t".to_string(),
+            seconds(duration),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+        ]);
+        if request.settings.audio_gain_db.abs() > 0.01 {
+            args.extend([
+                "-af".to_string(),
+                format!("volume={:.6}", db_to_linear(request.settings.audio_gain_db)),
+            ]);
+        }
+    } else {
+        args.extend([
+            "-filter_complex".to_string(),
+            build_audio_only_filter(request, audio_kept),
+            "-map".to_string(),
+            "[outa]".to_string(),
+        ]);
+    }
+    args.extend([
+        "-vn".to_string(),
+        "-sn".to_string(),
+        "-dn".to_string(),
+        "-c:a".to_string(),
+        profile.codec.to_string(),
+        "-ar".to_string(),
+        profile.sample_rate.to_string(),
+        "-ac".to_string(),
+        profile.channels.to_string(),
+        output_path.to_string_lossy().to_string(),
+    ]);
+    args
+}
+
+fn build_audio_only_filter(request: &ExportRequest, audio_kept: &[(f64, f64)]) -> String {
+    let mut parts = Vec::new();
+    for (index, (start, end)) in audio_kept.iter().enumerate() {
+        let output = if audio_kept.len() == 1 {
+            "[outa]".to_string()
+        } else {
+            format!("[a{}]", index)
+        };
+        let mut filter = format!(
+            "[0:a]atrim=start={}:end={},asetpts=PTS-STARTPTS",
+            seconds(*start),
+            seconds(*end)
+        );
+        if request.settings.audio_gain_db.abs() > 0.01 {
+            filter.push_str(&format!(
+                ",volume={:.6}",
+                db_to_linear(request.settings.audio_gain_db)
+            ));
+        }
+        filter.push_str(&output);
+        parts.push(filter);
+    }
+    if audio_kept.len() > 1 {
+        let inputs = (0..audio_kept.len())
+            .map(|index| format!("[a{}]", index))
+            .collect::<Vec<_>>()
+            .join("");
+        parts.push(format!("{}concat=n={}:v=0:a=1[outa]", inputs, audio_kept.len()));
+    }
+    parts.join(";")
 }
 
 fn export_size_capped(
@@ -2014,6 +2154,53 @@ fn attempt_output_path(output_path: &Path, attempt: usize) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("mp4");
     parent.join(format!("{}.sizecap-{}.{}", stem, attempt + 1, extension))
+}
+fn choose_audio_wav_profile(settings: &AppSettings, duration: f64) -> AudioWavProfile {
+    const PROFILES: [AudioWavProfile; 5] = [
+        AudioWavProfile {
+            codec: "pcm_s24le",
+            sample_rate: 48_000,
+            channels: 2,
+            kbps: 2304,
+        },
+        AudioWavProfile {
+            codec: "pcm_s16le",
+            sample_rate: 48_000,
+            channels: 2,
+            kbps: 1536,
+        },
+        AudioWavProfile {
+            codec: "pcm_s16le",
+            sample_rate: 44_100,
+            channels: 2,
+            kbps: 1412,
+        },
+        AudioWavProfile {
+            codec: "pcm_s16le",
+            sample_rate: 48_000,
+            channels: 1,
+            kbps: 768,
+        },
+        AudioWavProfile {
+            codec: "pcm_s16le",
+            sample_rate: 44_100,
+            channels: 1,
+            kbps: 706,
+        },
+    ];
+    if !settings.size_cap_enabled {
+        return PROFILES[0];
+    }
+    let target = target_size_bytes(settings.max_megabytes);
+    PROFILES
+        .iter()
+        .copied()
+        .find(|profile| estimate_audio_wav_bytes(*profile, duration) <= target)
+        .unwrap_or(PROFILES[PROFILES.len() - 1])
+}
+
+fn estimate_audio_wav_bytes(profile: AudioWavProfile, duration: f64) -> u64 {
+    ((profile.kbps as f64 * 1000.0 / 8.0) * duration.max(0.0) + 4096.0).ceil() as u64
 }
 
 fn cleanup_attempts(paths: &[PathBuf], keep: Option<&Path>) {

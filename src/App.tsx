@@ -21,8 +21,11 @@ import {
   Link2,
   Magnet,
   Maximize2,
+  Minimize2,
+  Minus,
   Pause,
   Play,
+  Plus,
   Radio,
   RotateCcw,
   Scissors,
@@ -45,6 +48,19 @@ import { Select } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import type { AppSettings, BenchmarkResult, Crop, CutRange, ExportRequest, ExportResult, PreviewCache, RecordingRequest, VideoInfo } from '@/types'
 import type { WaveformPeakData } from '@/types'
+import {
+  actualSizeViewer,
+  canvasBackingSize,
+  fitViewer,
+  initialViewerView,
+  panViewer,
+  resizeViewer,
+  resizeRectWithLockedAspect,
+  sourceRectToViewport,
+  viewportToSource,
+  zoomViewerAt,
+} from '@/viewerGeometry'
+import type { ViewerPoint, ViewerSize, ViewerView } from '@/viewerGeometry'
 
 const defaultSettings: AppSettings = {
   saveFolder: '',
@@ -168,6 +184,7 @@ function MainApp() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isGeneratingWaveform, setIsGeneratingWaveform] = useState(false)
   const frameRequestRef = useRef(0)
+  const clipEpochRef = useRef(0)
   const currentTimeRef = useRef(0)
   const timelineDragRef = useRef<TimelineDragState | null>(null)
   const timelineSurfaceRef = useRef<HTMLDivElement | null>(null)
@@ -178,6 +195,21 @@ function MainApp() {
   const editHistoryRef = useRef<{ past: EditSnapshot[]; future: EditSnapshot[]; activeLabel: string | null }>({ past: [], future: [], activeLabel: null })
   const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false })
   const playbackRef = useRef<HTMLVideoElement | null>(null)
+  const viewerCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const viewerSurfaceRef = useRef<HTMLDivElement | null>(null)
+  const viewerStillRef = useRef<HTMLImageElement | null>(null)
+  const [viewerMediaSize, setViewerMediaSize] = useState<{ width: number; height: number } | null>(null)
+  const [viewerSize, setViewerSize] = useState<{ width: number; height: number } | null>(null)
+  const [viewerView, setViewerView] = useState<ViewerView>(initialViewerView)
+  const viewerViewRef = useRef<ViewerView>(initialViewerView)
+  const previousViewerSizeRef = useRef<ViewerSize | null>(null)
+  const viewerClipIdRef = useRef<string | null>(null)
+  const viewerPanRef = useRef<{ pointerId: number; x: number; y: number } | null>(null)
+  const [isViewerPanning, setIsViewerPanning] = useState(false)
+  const [isViewerFullscreen, setIsViewerFullscreen] = useState(false)
+  const [viewerDrawTick, setViewerDrawTick] = useState(0)
+  const bumpViewerDraw = useCallback(() => setViewerDrawTick((value) => value + 1), [])
+  const viewerHasContentRef = useRef(false)
   const toggleRecordingRef = useRef<() => void>(() => undefined)
   const resetRecordingRef = useRef<() => void>(() => undefined)
   const startRegionRecordingRef = useRef<(region: Omit<RecordingRequest, 'settings'>) => void>(() => undefined)
@@ -254,8 +286,10 @@ function MainApp() {
 
     let frame = 0
     const startedAt = performance.now()
+    let lastUiUpdateAt = 0
     const tick = () => {
-      const elapsed = (performance.now() - startedAt) / 1000
+      const now = performance.now()
+      const elapsed = (now - startedAt) / 1000
       const previous = currentTimeRef.current
       const rawNext = media && !Number.isNaN(media.currentTime) ? media.currentTime : startTime + elapsed
       const next = nextPlayableSourceTime(previous, rawNext, cuts, trimStart, trimEnd)
@@ -273,7 +307,10 @@ function MainApp() {
         return
       }
       currentTimeRef.current = next
-      setCurrentTime(next)
+      if (now - lastUiUpdateAt >= 1000 / 30) {
+        lastUiUpdateAt = now
+        setCurrentTime(next)
+      }
       frame = requestAnimationFrame(tick)
     }
     frame = requestAnimationFrame(tick)
@@ -284,7 +321,10 @@ function MainApp() {
   }, [clip, cuts, isPlaying, trimEnd])
 
   const previewSrc = useMemo(() => {
-    if ((isPlaying || isCScrubbing) && !exactFrame) {
+    // C-scrub keeps the still mounted: it resolves to the preview-cache frame
+    // for the current time so the canvas can follow the cursor immediately.
+    // Only playback nulls it (the video is the live source while playing).
+    if (isPlaying && !exactFrame) {
       return null
     }
     if (exactFrame) {
@@ -295,10 +335,10 @@ function MainApp() {
     }
     const index = Math.round(currentTime * preview.fps)
     if (index < 0 || index >= preview.frames.length) {
-      return convertFileSrc(preview.frames[preview.frames.length - 1])
+      return null
     }
     return convertFileSrc(preview.frames[index])
-  }, [currentTime, exactFrame, isCScrubbing, isPlaying, preview])
+  }, [currentTime, exactFrame, isPlaying, preview])
   const clipMediaSrc = useMemo(() => (playbackPath ? convertFileSrc(playbackPath) : null), [playbackPath])
 
   useEffect(() => {
@@ -309,6 +349,298 @@ function MainApp() {
     media.load()
     media.currentTime = currentTimeRef.current
   }, [clipMediaSrc])
+
+  const viewerSourceSize = useMemo(
+    () => clip ? { width: clip.width, height: clip.height } : viewerMediaSize,
+    [clip, viewerMediaSize],
+  )
+
+  useEffect(() => {
+    viewerViewRef.current = viewerView
+  }, [viewerView])
+
+  useEffect(() => {
+    const surface = viewerSurfaceRef.current
+    if (!surface) {
+      return
+    }
+    const measure = () => setViewerSize({ width: surface.clientWidth, height: surface.clientHeight })
+    measure()
+    if (typeof ResizeObserver === 'undefined') {
+      return
+    }
+    const observer = new ResizeObserver(measure)
+    observer.observe(surface)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!viewerSize || !viewerSourceSize) {
+      return
+    }
+    const previousSize = previousViewerSizeRef.current ?? viewerSize
+    const clipId = clip?.id ?? null
+    const nextView = viewerClipIdRef.current !== clipId
+      ? fitViewer(viewerSize, viewerSourceSize)
+      : resizeViewer(viewerViewRef.current, previousSize, viewerSize, viewerSourceSize)
+    viewerClipIdRef.current = clipId
+    previousViewerSizeRef.current = viewerSize
+    viewerViewRef.current = nextView
+    setViewerView(nextView)
+  }, [clip?.id, viewerSize, viewerSourceSize])
+
+  useEffect(() => {
+    const canvas = viewerCanvasRef.current
+    if (!canvas || !viewerSize || viewerSize.width <= 0 || viewerSize.height <= 0) {
+      return
+    }
+    const { width, height } = canvasBackingSize(viewerSize, window.devicePixelRatio)
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width
+      canvas.height = height
+      viewerHasContentRef.current = false
+    }
+    bumpViewerDraw()
+  }, [bumpViewerDraw, viewerSize])
+
+  useEffect(() => {
+    setViewerMediaSize(null)
+    // New source: the old painted frame belongs to the previous clip.
+    viewerHasContentRef.current = false
+  }, [clipMediaSrc])
+
+  const drawViewerFrame = useCallback(() => {
+    const canvas = viewerCanvasRef.current
+    const sourceSize = viewerSourceSize
+    const viewportSize = viewerSize
+    if (!canvas || !sourceSize || !viewportSize || canvas.width === 0 || canvas.height === 0) {
+      return
+    }
+    const context = canvas.getContext('2d')
+    if (!context) {
+      return
+    }
+    const video = playbackRef.current
+    const still = viewerStillRef.current
+    const videoDrawable = Boolean(video && video.readyState >= 2 && video.videoWidth > 0)
+    const stillDrawable = Boolean(still && still.complete && still.naturalWidth > 0)
+    // True once the video has settled on the requested time (seek finished,
+    // no seek in flight). Its frame is native resolution, so a settled video
+    // is the highest-quality paused preview available.
+    const videoCurrent =
+      videoDrawable &&
+      video !== null &&
+      !video.seeking &&
+      Math.abs(video.currentTime - currentTimeRef.current) <= Math.max(1 / Math.max(1, settings.frameRate), 0.01)
+    const paint = (source: CanvasImageSource) => {
+      const view = viewerViewRef.current
+      const backingScaleX = canvas.width / Math.max(1, viewportSize.width)
+      const backingScaleY = canvas.height / Math.max(1, viewportSize.height)
+      context.setTransform(1, 0, 0, 1, 0, 0)
+      context.clearRect(0, 0, canvas.width, canvas.height)
+      context.imageSmoothingEnabled = true
+      context.imageSmoothingQuality = 'high'
+      context.setTransform(
+        backingScaleX * view.scale,
+        0,
+        0,
+        backingScaleY * view.scale,
+        backingScaleX * view.offsetX,
+        backingScaleY * view.offsetY,
+      )
+      context.drawImage(source, 0, 0, sourceSize.width, sourceSize.height)
+      viewerHasContentRef.current = true
+    }
+    if (isPlaying) {
+      if (video && videoDrawable) {
+        paint(video)
+      }
+      // else: video not ready yet — keep the last painted frame
+    } else if (isCScrubbing) {
+      // C-scrub follows the cursor with the preview-cache still; the video
+      // lags behind in-flight seeks, so it is never drawn while C-scrubbing.
+      if (still && stillDrawable) {
+        paint(still)
+      }
+      // else: next cache frame still loading — keep the last painted frame
+    } else if (exactFrame && stillDrawable) {
+      if (still) {
+        paint(still)
+      }
+    } else if (videoCurrent) {
+      if (video) {
+        paint(video)
+      }
+    } else if (stillDrawable) {
+      if (still) {
+        paint(still)
+      }
+    } else if (videoDrawable && !viewerHasContentRef.current) {
+      // Preparing state: the video is the only media and nothing is painted yet.
+      if (video) {
+        paint(video)
+      }
+    } else if (!viewerHasContentRef.current) {
+      context.setTransform(1, 0, 0, 1, 0, 0)
+      context.clearRect(0, 0, canvas.width, canvas.height)
+    }
+    // else: a new still is loading — keep the last painted frame (no flicker)
+  }, [exactFrame, isCScrubbing, isPlaying, settings.frameRate, viewerSize, viewerSourceSize])
+
+  useEffect(() => {
+    const media = playbackRef.current
+    if (!isPlaying || !media) {
+      return
+    }
+    let cancelled = false
+    let animationFrame = 0
+    let videoFrame = 0
+    if (typeof media.requestVideoFrameCallback === 'function') {
+      const tick = () => {
+        if (cancelled) {
+          return
+        }
+        drawViewerFrame()
+        videoFrame = media.requestVideoFrameCallback(tick)
+      }
+      videoFrame = media.requestVideoFrameCallback(tick)
+    } else {
+      const tick = () => {
+        if (cancelled) {
+          return
+        }
+        drawViewerFrame()
+        animationFrame = requestAnimationFrame(tick)
+      }
+      animationFrame = requestAnimationFrame(tick)
+    }
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(animationFrame)
+      if (videoFrame && typeof media.cancelVideoFrameCallback === 'function') {
+        media.cancelVideoFrameCallback(videoFrame)
+      }
+    }
+  }, [drawViewerFrame, isPlaying])
+
+  useEffect(() => {
+    if (isPlaying) {
+      return
+    }
+    const frame = requestAnimationFrame(drawViewerFrame)
+    return () => cancelAnimationFrame(frame)
+  }, [clipMediaSrc, drawViewerFrame, isCScrubbing, isPlaying, previewSrc, viewerDrawTick, viewerMediaSize, viewerSize, viewerView])
+
+  const commitViewerView = useCallback((update: (current: ViewerView) => ViewerView) => {
+    setViewerView((current) => {
+      const next = update(current)
+      viewerViewRef.current = next
+      return next
+    })
+  }, [])
+
+  const zoomViewerBy = useCallback((factor: number, anchor?: ViewerPoint) => {
+    if (!viewerSize || !viewerSourceSize) {
+      return
+    }
+    const zoomAnchor = anchor ?? { x: viewerSize.width / 2, y: viewerSize.height / 2 }
+    commitViewerView((current) => zoomViewerAt(current, zoomAnchor, current.scale * factor, viewerSize, viewerSourceSize))
+  }, [commitViewerView, viewerSize, viewerSourceSize])
+
+  const resetViewer = useCallback(() => {
+    if (!viewerSize || !viewerSourceSize) {
+      return
+    }
+    commitViewerView(() => fitViewer(viewerSize, viewerSourceSize))
+  }, [commitViewerView, viewerSize, viewerSourceSize])
+
+  const showViewerActualSize = useCallback(() => {
+    if (!viewerSize || !viewerSourceSize) {
+      return
+    }
+    commitViewerView(() => actualSizeViewer(viewerSize, viewerSourceSize))
+  }, [commitViewerView, viewerSize, viewerSourceSize])
+
+  const toggleViewerFullscreen = useCallback(() => {
+    if (!viewerSourceSize) {
+      return
+    }
+    const next = !isViewerFullscreen
+    resetViewer()
+    setIsViewerFullscreen(next)
+    if (canUseTauri()) {
+      void getCurrentWindow().setFullscreen(next).catch(() => undefined)
+    }
+  }, [isViewerFullscreen, resetViewer, viewerSourceSize])
+
+  const exitViewerFullscreen = useCallback(() => {
+    if (!isViewerFullscreen) {
+      return
+    }
+    resetViewer()
+    setIsViewerFullscreen(false)
+    if (canUseTauri()) {
+      void getCurrentWindow().setFullscreen(false).catch(() => undefined)
+    }
+  }, [isViewerFullscreen, resetViewer])
+
+  useEffect(() => {
+    const surface = viewerSurfaceRef.current
+    if (!surface || !viewerSize || !viewerSourceSize) {
+      return
+    }
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault()
+      const rect = surface.getBoundingClientRect()
+      const anchor = { x: event.clientX - rect.left, y: event.clientY - rect.top }
+      const deltaPixels = event.deltaY * (event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? rect.height : 1)
+      const factor = clamp(Math.exp(-deltaPixels * 0.0015), 0.8, 1.25)
+      zoomViewerBy(factor, anchor)
+    }
+    const onAuxClick = (event: MouseEvent) => {
+      if (event.button === 1) {
+        event.preventDefault()
+      }
+    }
+    surface.addEventListener('wheel', onWheel, { passive: false })
+    surface.addEventListener('auxclick', onAuxClick)
+    return () => {
+      surface.removeEventListener('wheel', onWheel)
+      surface.removeEventListener('auxclick', onAuxClick)
+    }
+  }, [viewerSize, viewerSourceSize, zoomViewerBy])
+
+  const beginViewerPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 1 || !viewerSourceSize) {
+      return
+    }
+    event.preventDefault()
+    viewerPanRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
+    setIsViewerPanning(true)
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  const moveViewerPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pan = viewerPanRef.current
+    if (!pan || pan.pointerId !== event.pointerId) {
+      return
+    }
+    const delta = { x: event.clientX - pan.x, y: event.clientY - pan.y }
+    pan.x = event.clientX
+    pan.y = event.clientY
+    commitViewerView((current) => panViewer(current, delta))
+  }
+
+  const endViewerPan = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (viewerPanRef.current?.pointerId !== event.pointerId) {
+      return
+    }
+    viewerPanRef.current = null
+    setIsViewerPanning(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
 
   const qualityMaxSeconds = useMemo(() => {
     const audioKbps = settings.includeAudio ? (settings.includeVideo ? 96 : 2304) : 0
@@ -471,7 +803,9 @@ function MainApp() {
 
   const loadClip = useCallback(
     async (nextClip: VideoInfo) => {
+      const clipEpoch = ++clipEpochRef.current
       frameRequestRef.current += 1
+      viewerClipIdRef.current = null
       setClip(nextClip)
       setPreview(null)
       setPlaybackPath(null)
@@ -517,6 +851,9 @@ function MainApp() {
             settings,
           }),
         ])
+        if (clipEpoch !== clipEpochRef.current) {
+          return
+        }
         if (playbackResult.status === 'fulfilled') {
           setPlaybackPath(playbackResult.value)
         } else {
@@ -532,10 +869,14 @@ function MainApp() {
         }
         setStatus('Clip ready')
       } catch (error) {
-        setStatus(shortError(error))
+        if (clipEpoch === clipEpochRef.current) {
+          setStatus(shortError(error))
+        }
       } finally {
-        setIsPreparing(false)
-        setIsGeneratingWaveform(false)
+        if (clipEpoch === clipEpochRef.current) {
+          setIsPreparing(false)
+          setIsGeneratingWaveform(false)
+        }
       }
     },
     [settings],
@@ -546,6 +887,7 @@ function MainApp() {
       if (!clip) {
         return
       }
+      const clipEpoch = clipEpochRef.current
       const requestId = ++frameRequestRef.current
       try {
         const path = await tauriInvoke<string>('extract_exact_frame', {
@@ -553,11 +895,11 @@ function MainApp() {
           secondsAt: time,
           settings,
         })
-        if (requestId === frameRequestRef.current) {
+        if (clipEpoch === clipEpochRef.current && requestId === frameRequestRef.current) {
           setExactFrame(path)
         }
       } catch (error) {
-        if (requestId === frameRequestRef.current) {
+        if (clipEpoch === clipEpochRef.current && requestId === frameRequestRef.current) {
           setStatus(shortError(error))
         }
       }
@@ -899,6 +1241,7 @@ function MainApp() {
       return
     }
     if (isPlaying) {
+      setCurrentTime(currentTimeRef.current)
       setIsPlaying(false)
       return
     }
@@ -1085,7 +1428,38 @@ function MainApp() {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
       const isEditable = target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.tagName === 'SELECT' || target?.isContentEditable
+      if (event.key === 'Escape' && isViewerFullscreen) {
+        event.preventDefault()
+        exitViewerFullscreen()
+        return
+      }
       if (isEditable || settingsOpen) {
+        return
+      }
+      if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === 'f' && !event.repeat) {
+        event.preventDefault()
+        toggleViewerFullscreen()
+        return
+      }
+      const commandKey = event.ctrlKey || event.metaKey
+      if (commandKey && (event.key === '+' || event.key === '=' || event.code === 'NumpadAdd')) {
+        event.preventDefault()
+        zoomViewerBy(1.25)
+        return
+      }
+      if (commandKey && (event.key === '-' || event.code === 'NumpadSubtract')) {
+        event.preventDefault()
+        zoomViewerBy(1 / 1.25)
+        return
+      }
+      if (commandKey && (event.key === '0' || event.code === 'Numpad0')) {
+        event.preventDefault()
+        resetViewer()
+        return
+      }
+      if (commandKey && (event.key === '1' || event.code === 'Numpad1')) {
+        event.preventDefault()
+        showViewerActualSize()
         return
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
@@ -1152,7 +1526,7 @@ function MainApp() {
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
     }
-  }, [clip, settingsOpen, stepFrame, toggleCut, togglePlayback])
+  }, [clip, exitViewerFullscreen, isViewerFullscreen, resetViewer, settingsOpen, showViewerActualSize, stepFrame, toggleCut, togglePlayback, toggleViewerFullscreen, zoomViewerBy])
 
   const secondsFromTimelinePointer = (element: HTMLElement, clientX: number, bounded = true) => {
     const rect = element.getBoundingClientRect()
@@ -1614,30 +1988,82 @@ function MainApp() {
           </Card>
         </aside>
 
-        <section className="viewer-column">
+        <section className={`viewer-column${isViewerFullscreen ? ' viewer-fullscreen' : ''}`}>
           <div className="viewer-toolbar">
             <span className="viewer-title">Viewer</span>
-            <Badge>{clip ? `${formatTime(currentTime)} / ${formatTime(clip.durationSeconds)}` : '00:00.000'}</Badge>
+            <div className="viewer-toolbar-actions">
+              <div className="viewer-zoom-controls" aria-label="Viewer zoom controls">
+                <Button size="icon" variant="ghost" disabled={!viewerSourceSize} aria-label="Zoom out" title="Zoom Out (Ctrl+-)" onClick={() => zoomViewerBy(1 / 1.25)}>
+                  <Minus />
+                </Button>
+                <span className="viewer-zoom-readout" aria-live="polite">{Math.round(viewerView.scale * 100)}%</span>
+                <Button size="icon" variant="ghost" disabled={!viewerSourceSize} aria-label="Zoom in" title="Zoom In (Ctrl++)" onClick={() => zoomViewerBy(1.25)}>
+                  <Plus />
+                </Button>
+                <Button size="sm" variant={viewerView.mode === 'fit' ? 'primary' : 'ghost'} disabled={!viewerSourceSize} title="Fit / Reset View (Ctrl+0)" onClick={resetViewer}>
+                  Fit
+                </Button>
+                <Button size="sm" variant={viewerView.mode === 'actual' ? 'primary' : 'ghost'} disabled={!viewerSourceSize} title="Actual Size (Ctrl+1)" onClick={showViewerActualSize}>
+                  1:1
+                </Button>
+                <Button size="icon" variant={isViewerFullscreen ? 'primary' : 'ghost'} disabled={!viewerSourceSize} aria-label={isViewerFullscreen ? 'Exit fullscreen viewer' : 'Fullscreen viewer'} title={`${isViewerFullscreen ? 'Exit Fullscreen' : 'Fullscreen Viewer'} (F)`} onClick={toggleViewerFullscreen}>
+                  {isViewerFullscreen ? <Minimize2 /> : <Maximize2 />}
+                </Button>
+              </div>
+              <Badge>{clip ? `${formatTime(currentTime)} / ${formatTime(clip.durationSeconds)}` : '00:00.000'}</Badge>
+            </div>
           </div>
-          <div className="viewer">
+          <div
+            className={`viewer${isViewerPanning ? ' panning' : ''}`}
+            ref={viewerSurfaceRef}
+            onPointerDown={beginViewerPan}
+            onPointerMove={moveViewerPan}
+            onPointerUp={endViewerPan}
+            onPointerCancel={endViewerPan}
+            onLostPointerCapture={endViewerPan}
+          >
             {clipMediaSrc && (
               <video
-                className={isPlaying || isCScrubbing || !previewSrc ? 'viewer-video active' : 'viewer-video'}
+                className="viewer-video"
                 ref={playbackRef}
                 src={clipMediaSrc}
                 preload="auto"
                 playsInline
+                onLoadedMetadata={(event) => {
+                  const media = event.currentTarget
+                  if (media.videoWidth > 0 && media.videoHeight > 0) {
+                    setViewerMediaSize({ width: media.videoWidth, height: media.videoHeight })
+                  }
+                  bumpViewerDraw()
+                }}
+                onSeeked={bumpViewerDraw}
               />
             )}
-            {previewSrc ? (
-              <img className={isPlaying || isCScrubbing ? 'viewer-still hidden' : 'viewer-still'} src={previewSrc} alt="" />
-            ) : (
-              <div className={clipMediaSrc ? 'empty-viewer hidden' : 'empty-viewer'}>
+            {previewSrc && (
+              <img
+                className="viewer-still"
+                ref={viewerStillRef}
+                src={previewSrc}
+                alt=""
+                onLoad={(event) => {
+                  const image = event.currentTarget
+                  const video = playbackRef.current
+                  const videoHasSize = Boolean(video && video.videoWidth > 0 && video.videoHeight > 0)
+                  if (image.naturalWidth > 0 && image.naturalHeight > 0 && !videoHasSize) {
+                    setViewerMediaSize({ width: image.naturalWidth, height: image.naturalHeight })
+                  }
+                  bumpViewerDraw()
+                }}
+              />
+            )}
+            <canvas className="viewer-canvas" ref={viewerCanvasRef} />
+            {!previewSrc && !clipMediaSrc && (
+              <div className="empty-viewer">
                 <Film className="size-12" />
                 <span>{isPreparing ? 'Preparing preview' : 'Open or record a clip'}</span>
               </div>
             )}
-            {clip && <CropOverlay crop={crop} sourceWidth={clip.width} sourceHeight={clip.height} onBeginEdit={() => beginEdit('Crop')} onEndEdit={finishEdit} onChange={(nextCrop) => setCrop(nextCrop)} />}
+            {clip && <CropOverlay crop={crop} sourceWidth={clip.width} sourceHeight={clip.height} view={viewerView} onBeginEdit={() => beginEdit('Crop')} onEndEdit={finishEdit} onChange={(nextCrop) => setCrop(nextCrop)} />}
           </div>
           <div className="transport">
             <Button size="icon" variant="ghost" onClick={() => stepFrame(-1, true)}>
@@ -1699,9 +2125,13 @@ function MainApp() {
                 Resize
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <NumberField label="W" value={outputWidth} onChange={(width) => { beginEdit('Resize field'); setOutputWidth(makeEven(width)); finishEdit() }} />
-                <NumberField label="H" value={outputHeight} onChange={(height) => { beginEdit('Resize field'); setOutputHeight(makeEven(height)); finishEdit() }} />
+                <NumberField label="W" value={outputWidth} onChange={(width) => { beginEdit('Resize field'); setAutoFit720(false); setOutputWidth(makeOutputDimension(width)); finishEdit() }} />
+                <NumberField label="H" value={outputHeight} onChange={(height) => { beginEdit('Resize field'); setAutoFit720(false); setOutputHeight(makeOutputDimension(height)); finishEdit() }} />
               </div>
+              <div className="output-size-summary">Crop {crop.width}x{crop.height} → Output {outputWidth}x{outputHeight}</div>
+              {Math.abs(crop.width / Math.max(1, crop.height) - outputWidth / Math.max(1, outputHeight)) > 0.001 && (
+                <div className="output-size-warning">Aspect mismatch: export will stretch</div>
+              )}
               <Button
                 className="w-full"
                 variant={autoFit720 ? 'primary' : 'default'}
@@ -2336,6 +2766,7 @@ function CropOverlay({
   crop,
   sourceWidth,
   sourceHeight,
+  view,
   onBeginEdit,
   onEndEdit,
   onChange,
@@ -2343,95 +2774,93 @@ function CropOverlay({
   crop: Crop
   sourceWidth: number
   sourceHeight: number
+  view: ViewerView
   onBeginEdit: () => void
   onEndEdit: () => void
   onChange: (crop: Crop) => void
 }) {
   const layerRef = useRef<HTMLDivElement | null>(null)
-  const dragRef = useRef<{ mode: 'move' | 'tl' | 'tr' | 'bl' | 'br'; x: number; y: number; crop: Crop } | null>(null)
-  const [layoutVersion, setLayoutVersion] = useState(0)
-  const [layerElement, setLayerElement] = useState<HTMLDivElement | null>(null)
-  const setLayerRef = useCallback((node: HTMLDivElement | null) => {
-    layerRef.current = node
-    setLayerElement(node)
-  }, [])
-  const rect = cropDisplayRect(crop, sourceWidth, sourceHeight, layerElement)
+  const dragRef = useRef<{ mode: 'move' | 'tl' | 'tr' | 'bl' | 'br'; start: ViewerPoint; crop: Crop } | null>(null)
+  const rect = sourceRectToViewport(crop, view)
 
-  useEffect(() => {
-    const update = () => setLayoutVersion((value) => value + 1)
-    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update)
-    if (layerRef.current) {
-      observer?.observe(layerRef.current)
-    }
-    window.addEventListener('resize', update)
-    return () => {
-      observer?.disconnect()
-      window.removeEventListener('resize', update)
-    }
-  }, [])
+  const sourcePointFromClient = (clientX: number, clientY: number) => {
+    const bounds = layerRef.current?.getBoundingClientRect()
+    return viewportToSource({
+      x: clientX - (bounds?.left ?? 0),
+      y: clientY - (bounds?.top ?? 0),
+    }, view)
+  }
 
-  const applyDrag = (clientX: number, clientY: number) => {
+  const applyDrag = (clientX: number, clientY: number, lockAspect: boolean) => {
     const drag = dragRef.current
-    const layer = layerRef.current
-    if (!drag || !layer) {
+    if (!drag) {
       return
     }
-    const bounds = imageDisplayBounds(layer, sourceWidth, sourceHeight)
-    const scale = bounds.width / Math.max(1, sourceWidth)
-    const dx = Math.round((clientX - drag.x) / Math.max(0.001, scale))
-    const dy = Math.round((clientY - drag.y) / Math.max(0.001, scale))
+    const current = sourcePointFromClient(clientX, clientY)
+    const dx = Math.round(current.x - drag.start.x)
+    const dy = Math.round(current.y - drag.start.y)
     const c = drag.crop
-    const next = drag.mode === 'move'
-      ? { ...c, x: c.x + dx, y: c.y + dy }
-      : drag.mode === 'tl'
-        ? { x: c.x + dx, y: c.y + dy, width: c.width - dx, height: c.height - dy }
-        : drag.mode === 'tr'
-          ? { x: c.x, y: c.y + dy, width: c.width + dx, height: c.height - dy }
-          : drag.mode === 'bl'
-            ? { x: c.x + dx, y: c.y, width: c.width - dx, height: c.height + dy }
-            : { x: c.x, y: c.y, width: c.width + dx, height: c.height + dy }
+    const next = lockAspect && drag.mode !== 'move'
+      ? resizeRectWithLockedAspect(c, { width: sourceWidth, height: sourceHeight }, drag.mode, { x: dx, y: dy })
+      : drag.mode === 'move'
+        ? { ...c, x: c.x + dx, y: c.y + dy }
+        : drag.mode === 'tl'
+          ? { x: c.x + dx, y: c.y + dy, width: c.width - dx, height: c.height - dy }
+          : drag.mode === 'tr'
+            ? { x: c.x, y: c.y + dy, width: c.width + dx, height: c.height - dy }
+            : drag.mode === 'bl'
+              ? { x: c.x + dx, y: c.y, width: c.width - dx, height: c.height + dy }
+              : { x: c.x, y: c.y, width: c.width + dx, height: c.height + dy }
     onChange(clampCropForDrag(next, sourceWidth, sourceHeight, drag.mode))
   }
 
+  const beginDrag = (event: ReactPointerEvent<HTMLElement>, mode: 'move' | 'tl' | 'tr' | 'bl' | 'br') => {
+    if (event.button !== 0) {
+      return
+    }
+    event.stopPropagation()
+    onBeginEdit()
+    dragRef.current = { mode, start: sourcePointFromClient(event.clientX, event.clientY), crop }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  const finishDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if (!dragRef.current) {
+      return
+    }
+    dragRef.current = null
+    onEndEdit()
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
   return (
-    <div
-      className="crop-layer"
-      data-layout={layoutVersion}
-      ref={setLayerRef}
-    >
+    <div className="crop-layer" ref={layerRef}>
       <div
-      className="crop-overlay"
-      style={{
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height,
-      }}
-      onPointerDown={(event) => {
-        event.stopPropagation()
-        onBeginEdit()
-        dragRef.current = { mode: 'move', x: event.clientX, y: event.clientY, crop }
-        event.currentTarget.setPointerCapture(event.pointerId)
-      }}
-      onPointerMove={(event) => applyDrag(event.clientX, event.clientY)}
-      onPointerUp={(event) => {
-        dragRef.current = null
-        onEndEdit()
-        if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-          event.currentTarget.releasePointerCapture(event.pointerId)
-        }
-      }}
-    >
+        className="crop-overlay"
+        title="Drag to move. Hold Shift while dragging a corner to lock the current aspect ratio."
+        style={{
+          left: rect.x,
+          top: rect.y,
+          width: rect.width,
+          height: rect.height,
+        }}
+        onPointerDown={(event) => beginDrag(event, 'move')}
+        onPointerMove={(event) => applyDrag(event.clientX, event.clientY, event.shiftKey)}
+        onPointerUp={finishDrag}
+        onPointerCancel={finishDrag}
+        onLostPointerCapture={finishDrag}
+      >
         {(['tl', 'tr', 'bl', 'br'] as const).map((mode) => (
           <i
             className={`crop-handle ${mode}`}
             key={mode}
-            onPointerDown={(event) => {
-              event.stopPropagation()
-              onBeginEdit()
-              dragRef.current = { mode, x: event.clientX, y: event.clientY, crop }
-              event.currentTarget.setPointerCapture(event.pointerId)
-            }}
+            onPointerDown={(event) => beginDrag(event, mode)}
+            onPointerMove={(event) => applyDrag(event.clientX, event.clientY, event.shiftKey)}
+            onPointerUp={finishDrag}
+            onPointerCancel={finishDrag}
+            onLostPointerCapture={finishDrag}
           />
         ))}
       </div>
@@ -2639,33 +3068,6 @@ function marqueeSelectionStyle(selection: NonNullable<MarqueeSelection>) {
   }
 }
 
-function imageDisplayBounds(element: HTMLElement, sourceWidth: number, sourceHeight: number) {
-  const rect = element.getBoundingClientRect()
-  const scale = Math.min(rect.width / Math.max(1, sourceWidth), rect.height / Math.max(1, sourceHeight))
-  const width = sourceWidth * scale
-  const height = sourceHeight * scale
-  return {
-    left: (rect.width - width) / 2,
-    top: (rect.height - height) / 2,
-    width,
-    height,
-  }
-}
-
-function cropDisplayRect(crop: Crop, sourceWidth: number, sourceHeight: number, element: HTMLElement | null) {
-  if (!element) {
-    return { left: 0, top: 0, width: 0, height: 0 }
-  }
-  const bounds = imageDisplayBounds(element, sourceWidth, sourceHeight)
-  const scale = bounds.width / Math.max(1, sourceWidth)
-  return {
-    left: bounds.left + crop.x * scale,
-    top: bounds.top + crop.y * scale,
-    width: crop.width * scale,
-    height: crop.height * scale,
-  }
-}
-
 function clampCrop(crop: Crop, sourceWidth: number, sourceHeight: number) {
   const width = makeEven(clamp(crop.width, 8, sourceWidth))
   const height = makeEven(clamp(crop.height, 8, sourceHeight))
@@ -2724,6 +3126,10 @@ function cropForAspect(sourceWidth: number, sourceHeight: number, aspect: number
 function makeEven(value: number) {
   const rounded = Math.max(2, Math.round(value))
   return rounded % 2 === 0 ? rounded : rounded - 1
+}
+
+function makeOutputDimension(value: number) {
+  return clamp(makeEven(value), 2, 16384)
 }
 
 function timelinePercent(secondsAt: number, viewport: { start: number; span: number }) {

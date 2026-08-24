@@ -289,6 +289,40 @@ textarea {
   padding: 0 8px;
 }
 
+.viewer-column.viewer-fullscreen {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  grid-template-rows: 36px minmax(0, 1fr) 46px;
+  border: 0;
+  border-radius: 0;
+}
+
+.viewer-toolbar-actions,
+.viewer-zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.viewer-toolbar-actions {
+  gap: 8px;
+}
+
+.viewer-zoom-controls .size-8 {
+  width: 26px;
+  height: 26px;
+}
+
+.viewer-zoom-readout {
+  min-width: 44px;
+  color: #d7dde7;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
 .viewer-title {
   color: #9aa4b3;
   font-size: 12px;
@@ -304,29 +338,33 @@ textarea {
   background:
     radial-gradient(circle at center, #151922, #090a0d 72%),
     #090a0d;
+  touch-action: none;
+}
+
+.viewer.panning,
+.viewer.panning .crop-overlay,
+.viewer.panning .crop-handle {
+  cursor: grabbing;
 }
 
 .viewer-video,
 .viewer-still {
   position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.viewer-canvas {
+  position: absolute;
   inset: 0;
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: contain;
-}
-
-.viewer-video {
-  opacity: 0;
-}
-
-.viewer-video.active {
-  opacity: 1;
-}
-
-.viewer-still.hidden,
-.empty-viewer.hidden {
-  opacity: 0;
+  pointer-events: none;
 }
 
 .empty-viewer {
@@ -351,6 +389,18 @@ textarea {
 .crop-layer {
   position: absolute;
   inset: 0;
+}
+
+.output-size-summary {
+  color: #8993a2;
+  font-size: 11px;
+  text-align: center;
+}
+
+.output-size-warning {
+  color: #f0b36a;
+  font-size: 11px;
+  text-align: center;
 }
 
 .crop-handle {

@@ -78,6 +78,8 @@ const defaultSettings: AppSettings = {
   encoderBenchmarks: [],
   includeVideo: true,
   includeAudio: true,
+  bestAudio: true,
+  audioQuality: 'best',
   audioDeviceName: '',
   startWithWindows: true,
   startHiddenInTray: true,
@@ -645,12 +647,16 @@ function MainApp() {
   }
 
   const qualityMaxSeconds = useMemo(() => {
-    const audioKbps = settings.includeAudio ? (settings.includeVideo ? 96 : 2304) : 0
+    const audioKbps = settings.includeAudio
+      ? settings.includeVideo
+        ? settings.audioQuality === 'standard' ? 160 : 320
+        : settings.audioQuality === 'best' ? 2304 : settings.audioQuality === 'optimized' ? 1536 : 1412
+      : 0
     const pixels = Math.max(1, outputWidth * outputHeight)
     const scale = pixels / (1920 * 1080)
     const videoKbps = settings.includeVideo ? Math.max(1200, Math.min(settings.qualityTargetKbps, Math.round(settings.qualityTargetKbps * scale))) : 0
     return (settings.maxMegabytes * 8192 * 0.985) / Math.max(1, videoKbps + audioKbps)
-  }, [outputHeight, outputWidth, settings.includeAudio, settings.includeVideo, settings.maxMegabytes, settings.qualityTargetKbps])
+  }, [outputHeight, outputWidth, settings.audioQuality, settings.includeAudio, settings.includeVideo, settings.maxMegabytes, settings.qualityTargetKbps])
 
   const timelineViewport = useMemo(() => {
     const duration = timelineDurationFor(clip?.durationSeconds || 1, keptSeconds, timelineOffset, audioKeptSeconds, audioTimelineOffset)
@@ -1414,6 +1420,14 @@ function MainApp() {
     setStatus('Edits reset')
   }
 
+  const applyCropChange = (nextCrop: Crop) => {
+    setCrop(nextCrop)
+    if (!autoFit720) {
+      setOutputWidth(makeOutputDimension(nextCrop.width))
+      setOutputHeight(makeOutputDimension(nextCrop.height))
+    }
+  }
+
   useEffect(() => {
     toggleRecordingRef.current = () => {
       void toggleRecording()
@@ -1913,6 +1927,23 @@ function MainApp() {
             />
             Audio
           </label>
+          {settings.includeAudio && (
+            <select
+              className="top-select has-tooltip"
+              data-tooltip="Audio Quality: Best uses 24-bit PCM for WAV and 320 kbps AAC for MP4; Optimized uses 16-bit PCM or 320 kbps AAC; Standard uses 16-bit 44.1 kHz PCM or 160 kbps AAC."
+              title="Audio quality preset"
+              value={settings.audioQuality ?? (settings.bestAudio ? 'best' : 'standard')}
+              onChange={(event) => setSettings((value) => ({
+                ...value,
+                audioQuality: event.target.value as 'optimized' | 'best' | 'standard',
+                bestAudio: event.target.value === 'best',
+              }))}
+            >
+              <option value="optimized">Optimized (320k)</option>
+              <option value="best">Best Audio</option>
+              <option value="standard">Standard (160k)</option>
+            </select>
+          )}
           <label
             className="top-toggle has-tooltip"
             data-tooltip={`Size Cap targets ${settings.maxMegabytes.toFixed(1)} MB by adjusting export bitrate and retrying up to 5 times. Audio-only WAV uses the highest PCM profile that fits. Turn it off to preserve source quality.`}
@@ -2075,7 +2106,7 @@ function MainApp() {
                 <span>{isPreparing ? 'Preparing preview' : 'Open or record a clip'}</span>
               </div>
             )}
-            {clip && <CropOverlay crop={crop} sourceWidth={clip.width} sourceHeight={clip.height} view={viewerView} onBeginEdit={() => beginEdit('Crop')} onEndEdit={finishEdit} onChange={(nextCrop) => setCrop(nextCrop)} />}
+            {clip && <CropOverlay crop={crop} sourceWidth={clip.width} sourceHeight={clip.height} view={viewerView} forceAspectLock={autoFit720} onBeginEdit={() => beginEdit('Crop')} onEndEdit={finishEdit} onChange={applyCropChange} />}
           </div>
           <div className="transport">
             <Button size="icon" variant="ghost" onClick={() => stepFrame(-1, true)}>
@@ -2126,10 +2157,10 @@ function MainApp() {
                 Crop
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <NumberField label="X" value={crop.x} onChange={(x) => { beginEdit('Crop field'); setCrop((value) => clip ? clampCrop({ ...value, x }, clip.width, clip.height) : { ...value, x }); finishEdit() }} />
-                <NumberField label="Y" value={crop.y} onChange={(y) => { beginEdit('Crop field'); setCrop((value) => clip ? clampCrop({ ...value, y }, clip.width, clip.height) : { ...value, y }); finishEdit() }} />
-                <NumberField label="W" value={crop.width} onChange={(width) => { beginEdit('Crop field'); setCrop((value) => clip ? clampCrop({ ...value, width: makeEven(width) }, clip.width, clip.height) : { ...value, width: makeEven(width) }); finishEdit() }} />
-                <NumberField label="H" value={crop.height} onChange={(height) => { beginEdit('Crop field'); setCrop((value) => clip ? clampCrop({ ...value, height: makeEven(height) }, clip.width, clip.height) : { ...value, height: makeEven(height) }); finishEdit() }} />
+                <NumberField label="X" value={crop.x} onChange={(x) => { beginEdit('Crop field'); applyCropChange(clip ? clampCrop({ ...crop, x }, clip.width, clip.height) : { ...crop, x }); finishEdit() }} />
+                <NumberField label="Y" value={crop.y} onChange={(y) => { beginEdit('Crop field'); applyCropChange(clip ? clampCrop({ ...crop, y }, clip.width, clip.height) : { ...crop, y }); finishEdit() }} />
+                <NumberField label="W" value={crop.width} onChange={(width) => { beginEdit('Crop field'); applyCropChange(clip ? clampCrop({ ...crop, width: makeEven(width) }, clip.width, clip.height) : { ...crop, width: makeEven(width) }); finishEdit() }} />
+                <NumberField label="H" value={crop.height} onChange={(height) => { beginEdit('Crop field'); applyCropChange(clip ? clampCrop({ ...crop, height: makeEven(height) }, clip.width, clip.height) : { ...crop, height: makeEven(height) }); finishEdit() }} />
               </div>
               <Separator />
               <div className="section-label">
@@ -2486,6 +2517,21 @@ function MainApp() {
                   ))}
                 </Select>
               </div>
+              <div className="space-y-1">
+                <Label>Audio Quality</Label>
+                <Select
+                  value={settings.audioQuality ?? (settings.bestAudio ? 'best' : 'standard')}
+                  onChange={(event) => setSettings((value) => ({
+                    ...value,
+                    audioQuality: event.target.value as 'optimized' | 'best' | 'standard',
+                    bestAudio: event.target.value === 'best',
+                  }))}
+                >
+                  <option value="optimized">Optimized (320 kbps AAC compressed - Recommended)</option>
+                  <option value="best">Best Audio (24-bit Lossless WAV / 320 kbps MP4)</option>
+                  <option value="standard">Standard (160 kbps AAC)</option>
+                </Select>
+              </div>
               <div className="inline-field">
                 <div className="space-y-1">
                   <Label>Audio Device</Label>
@@ -2559,8 +2605,19 @@ function TimelineWaveform({
   onGainChange: (gainDb: number) => void
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const dragRef = useRef<{ mode: 'seek' | 'gain' } | null>(null)
+  const dragRef = useRef<{ startY: number; startGain: number; isDragging: boolean } | null>(null)
   const [cursor, setCursor] = useState('default')
+
+  const finishGainDrag = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const drag = dragRef.current
+    dragRef.current = null
+    if (drag?.isDragging) {
+      onEndEdit()
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -2616,6 +2673,7 @@ function TimelineWaveform({
     context.stroke()
     context.strokeStyle = '#f4f7fb'
     context.globalAlpha = 0.88
+    context.lineWidth = 1.5
     context.beginPath()
     context.moveTo(0, gainY)
     context.lineTo(rect.width, gainY)
@@ -2628,39 +2686,61 @@ function TimelineWaveform({
       <canvas
         aria-label="Source waveform"
         className="waveform-canvas"
-        onPointerDown={(event) => {
+        onDoubleClick={(event) => {
           const rect = event.currentTarget.getBoundingClientRect()
           const y = event.clientY - rect.top
-          const mode = Math.abs(y - gainToY(gainDb, rect.height)) <= 14 ? 'gain' : 'seek'
-          if (mode !== 'gain') {
+          const gainY = gainToY(gainDb, rect.height)
+          if (Math.abs(y - gainY) <= 12) {
+            event.preventDefault()
+            event.stopPropagation()
+            onBeginEdit()
+            onGainChange(0)
+            onEndEdit()
+          }
+        }}
+        onPointerDown={(event) => {
+          if (event.button !== 0) {
+            return
+          }
+          const rect = event.currentTarget.getBoundingClientRect()
+          const y = event.clientY - rect.top
+          const gainY = gainToY(gainDb, rect.height)
+          if (Math.abs(y - gainY) > 8) {
+            // Clicking above or below line will NOT change audio level!
+            // Let the event bubble up to select the audio clip.
             return
           }
           event.preventDefault()
           event.stopPropagation()
-          onBeginEdit()
-          dragRef.current = { mode }
-          onGainChange(yToGain(y, rect.height))
+          dragRef.current = { startY: y, startGain: gainDb, isDragging: false }
           event.currentTarget.setPointerCapture(event.pointerId)
         }}
         onPointerMove={(event) => {
           const rect = event.currentTarget.getBoundingClientRect()
           const y = event.clientY - rect.top
+          const gainY = gainToY(gainDb, rect.height)
           const drag = dragRef.current
           if (!drag) {
-            setCursor(Math.abs(y - gainToY(gainDb, rect.height)) <= 14 ? 'ns-resize' : 'pointer')
+            setCursor(Math.abs(y - gainY) <= 8 ? 'ns-resize' : 'default')
             return
           }
           event.preventDefault()
           event.stopPropagation()
-          onGainChange(yToGain(event.clientY - rect.top, rect.height))
-        }}
-        onPointerUp={(event) => {
-          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-            event.currentTarget.releasePointerCapture(event.pointerId)
+          const dy = y - drag.startY
+          if (!drag.isDragging) {
+            if (Math.abs(dy) >= 3) {
+              drag.isDragging = true
+              onBeginEdit()
+            }
           }
-          dragRef.current = null
-          onEndEdit()
+          if (drag.isDragging) {
+            const newY = gainToY(drag.startGain, rect.height) + dy
+            onGainChange(yToGain(newY, rect.height))
+          }
         }}
+        onPointerUp={finishGainDrag}
+        onPointerCancel={finishGainDrag}
+        onLostPointerCapture={finishGainDrag}
         ref={canvasRef}
         style={{ cursor }}
       />
@@ -2779,6 +2859,7 @@ function CropOverlay({
   sourceWidth,
   sourceHeight,
   view,
+  forceAspectLock,
   onBeginEdit,
   onEndEdit,
   onChange,
@@ -2787,6 +2868,7 @@ function CropOverlay({
   sourceWidth: number
   sourceHeight: number
   view: ViewerView
+  forceAspectLock: boolean
   onBeginEdit: () => void
   onEndEdit: () => void
   onChange: (crop: Crop) => void
@@ -2812,7 +2894,7 @@ function CropOverlay({
     const dx = Math.round(current.x - drag.start.x)
     const dy = Math.round(current.y - drag.start.y)
     const c = drag.crop
-    const next = lockAspect && drag.mode !== 'move'
+    const next = (lockAspect || forceAspectLock) && drag.mode !== 'move'
       ? resizeRectWithLockedAspect(c, { width: sourceWidth, height: sourceHeight }, drag.mode, { x: dx, y: dy })
       : drag.mode === 'move'
         ? { ...c, x: c.x + dx, y: c.y + dy }

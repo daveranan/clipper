@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -29,12 +29,14 @@ struct ActiveRecording {
     child: Child,
     overlay_child: Option<Child>,
     audio: Option<LoopbackRecording>,
+    audio_lead_seconds: f64,
     path: PathBuf,
 }
 
 struct LoopbackRecording {
     stop: Arc<AtomicBool>,
     thread: thread::JoinHandle<Result<Option<PathBuf>, String>>,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +58,10 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     include_video: bool,
     include_audio: bool,
+    #[serde(default = "default_true")]
+    best_audio: bool,
+    #[serde(default = "default_audio_quality")]
+    audio_quality: String,
     audio_device_name: String,
     start_with_windows: bool,
     #[serde(default = "default_true")]
@@ -87,6 +93,8 @@ impl Default for AppSettings {
             encoder_benchmarks: Vec::new(),
             include_video: true,
             include_audio: true,
+            best_audio: true,
+            audio_quality: "best".to_string(),
             audio_device_name: String::new(),
             start_with_windows: true,
             start_hidden_in_tray: true,
@@ -95,6 +103,10 @@ impl Default for AppSettings {
             github_repository_url: "https://github.com/daveranan/clipper".to_string(),
         }
     }
+}
+
+fn default_audio_quality() -> String {
+    "best".to_string()
 }
 
 fn default_true() -> bool {
@@ -688,6 +700,29 @@ async fn export_clip(request: ExportRequest) -> Result<ExportResult, String> {
     .map_err(|error| format!("Export worker failed: {}", error))?
 }
 
+fn effective_audio_quality(settings: &AppSettings) -> &str {
+    match settings.audio_quality.as_str() {
+        "best" | "optimized" | "standard" => settings.audio_quality.as_str(),
+        _ if settings.best_audio => "best",
+        _ => "standard",
+    }
+}
+
+fn determine_audio_kbps(settings: &AppSettings, duration: f64, has_audio_output: bool) -> u32 {
+    if !has_audio_output {
+        return 0;
+    }
+    let quality = effective_audio_quality(settings);
+    let target = if quality == "standard" { 160 } else { 320 };
+    if !settings.size_cap_enabled {
+        return target;
+    }
+    let total_kbps =
+        ((settings.max_megabytes.max(0.1) * 8192.0 * 0.985) / duration.max(0.5)) as u32;
+    let cap_target = if quality == "standard" { 128 } else { 320 };
+    cap_target.min(total_kbps.saturating_sub(250)).max(64)
+}
+
 fn export_with_encoder(
     request: &ExportRequest,
     encoder_key: &str,
@@ -717,13 +752,14 @@ fn export_with_encoder(
     let source_duration = source_info.duration_seconds;
     let source_has_audio = source_has_audio(&request.settings, source_path);
     let export_crop = clamp_export_crop(&request.crop, source_width, source_height);
+
     let audio_kept = if request.settings.include_audio {
         kept_segments(request.audio_start, request.audio_end, &request.audio_cuts)
     } else {
         Vec::new()
     };
     let has_audio_output = source_has_audio && !audio_kept.is_empty();
-    let audio_kbps = if has_audio_output { 96 } else { 0 };
+    let audio_kbps = determine_audio_kbps(&request.settings, duration, has_audio_output);
 
     let bytes = if request.settings.size_cap_enabled {
         export_size_capped(
@@ -759,6 +795,7 @@ fn export_with_encoder(
             source_height,
             source_has_audio,
             None,
+            audio_kbps,
         )?
     };
 
@@ -924,6 +961,7 @@ fn export_size_capped(
             source_height,
             source_has_audio,
             Some(next_kbps),
+            audio_kbps,
         ) {
             Ok(bytes) => {
                 let result = ExportAttemptResult {
@@ -998,6 +1036,7 @@ fn export_once(
     source_height: u32,
     source_has_audio: bool,
     video_kbps: Option<u32>,
+    audio_kbps: u32,
 ) -> Result<u64, String> {
     let args = build_export_args(
         request,
@@ -1008,6 +1047,7 @@ fn export_once(
         source_height,
         source_has_audio,
         video_kbps,
+        audio_kbps,
     );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     if let Err(error) = run_command(&request.settings.ffmpeg_path, &arg_refs, "Export failed") {
@@ -1028,6 +1068,7 @@ fn build_export_args(
     source_height: u32,
     source_has_audio: bool,
     video_kbps: Option<u32>,
+    audio_kbps: u32,
 ) -> Vec<String> {
     let duration = kept_duration(request.start, request.end, &request.cuts);
     let video_kept = kept_segments(request.start, request.end, &request.cuts);
@@ -1064,7 +1105,7 @@ fn build_export_args(
                 "-c:a".to_string(),
                 "aac".to_string(),
                 "-b:a".to_string(),
-                "96k".to_string(),
+                format!("{}k", audio_kbps.max(64)),
             ]);
             if request.settings.audio_gain_db.abs() > 0.01 {
                 args.extend([
@@ -1088,7 +1129,7 @@ fn build_export_args(
                 "-c:a".to_string(),
                 "aac".to_string(),
                 "-b:a".to_string(),
-                "96k".to_string(),
+                format!("{}k", audio_kbps.max(64)),
             ]);
         } else {
             args.extend(["-map".to_string(), "[outv]".to_string(), "-an".to_string()]);
@@ -1270,13 +1311,29 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
         path.to_string_lossy().to_string(),
     ]);
 
+    // Make audio readiness part of recording startup. This both guarantees that
+    // every master has audio and gives muxing a measured lead to trim.
+    let audio = start_loopback_recording()
+        .map_err(|error| format!("Could not start system audio capture: {}", error))?;
     let mut command = hidden_command(&request.settings.ffmpeg_path);
-    let mut child = command
+    let mut child = match command
         .args(args)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("Could not start FFmpeg: {}", error))?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = stop_loopback_recording(Some(audio));
+            return Err(format!("Could not start FFmpeg: {}", error));
+        }
+    };
+    let video_started_at = Instant::now();
+    let audio_lead_seconds = video_started_at
+        .checked_duration_since(audio.started_at)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let audio = Some(audio);
 
     thread::sleep(Duration::from_millis(250));
     if child
@@ -1284,6 +1341,7 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
         .map_err(|error| error.to_string())?
         .is_some()
     {
+        let _ = stop_loopback_recording(audio);
         let mut stderr = String::new();
         if let Some(mut pipe) = child.stderr.take() {
             let _ = pipe.read_to_string(&mut stderr);
@@ -1291,16 +1349,12 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
         return Err(format!("Recording failed to start: {}", stderr.trim()));
     }
 
-    let audio = if request.settings.include_audio {
-        Some(start_loopback_recording()?)
-    } else {
-        None
-    };
     let overlay_child = start_recording_overlay(request.x, request.y, width, height).ok();
     Ok(ActiveRecording {
         child,
         overlay_child,
         audio,
+        audio_lead_seconds,
         path,
     })
 }
@@ -1316,25 +1370,48 @@ fn stop_recording(settings: AppSettings, state: State<'_, AppState>) -> Result<V
     };
 
     stop_recording_overlay(&mut recording.overlay_child);
+    let mut stop_signal_error = None;
     if let Some(stdin) = recording.child.stdin.as_mut() {
         if let Err(error) = stdin.write_all(b"q\n") {
             if error.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(error.to_string());
+                stop_signal_error = Some(error.to_string());
             }
         }
     }
-    let output = recording
-        .child
-        .wait_with_output()
-        .map_err(|error| error.to_string())?;
+    let output = recording.child.wait_with_output();
+    let audio_result = stop_loopback_recording(recording.audio.take());
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            if let Ok(Some(audio_path)) = audio_result {
+                let _ = fs::remove_file(audio_path);
+            }
+            return Err(error.to_string());
+        }
+    };
     if !output.status.success() {
+        if let Ok(Some(audio_path)) = audio_result {
+            let _ = fs::remove_file(audio_path);
+        }
         return Err(format!(
             "Recording failed: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    if let Some(audio_path) = stop_loopback_recording(recording.audio.take())? {
-        mux_recording_audio(&settings.ffmpeg_path, &recording.path, &audio_path)?;
+    if let Some(error) = stop_signal_error {
+        if let Ok(Some(audio_path)) = audio_result {
+            let _ = fs::remove_file(audio_path);
+        }
+        return Err(error);
+    }
+    if let Some(audio_path) = audio_result? {
+        mux_recording_audio(
+            &settings.ffmpeg_path,
+            &recording.path,
+            &audio_path,
+            recording.audio_lead_seconds,
+        )?;
     }
 
     probe_video_file(&settings, &recording.path, &recording.path)?
@@ -1592,8 +1669,24 @@ fn start_loopback_recording() -> Result<LoopbackRecording, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
     let path = std::env::temp_dir().join(format!("quickclipper-audio-{}.wav", timestamp()));
-    let thread = thread::spawn(move || capture_loopback_to_wav(worker_stop, path));
-    Ok(LoopbackRecording { stop, thread })
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    let thread = thread::spawn(move || capture_loopback_to_wav(worker_stop, path, ready_sender));
+    match ready_receiver.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(started_at)) => Ok(LoopbackRecording {
+            stop,
+            thread,
+            started_at,
+        }),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(error)
+        }
+        Err(_) => {
+            stop.store(true, Ordering::SeqCst);
+            let _ = thread.join();
+            Err("Timed out while starting system audio capture.".to_string())
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -1618,12 +1711,14 @@ fn stop_loopback_recording(
 fn capture_loopback_to_wav(
     stop: Arc<AtomicBool>,
     path: PathBuf,
+    ready_sender: mpsc::SyncSender<Result<Instant, String>>,
 ) -> Result<Option<PathBuf>, String> {
     use std::{ptr::null_mut, slice};
     use windows::Win32::{
         Media::Audio::{
-            eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-            MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+            eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient,
+            IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
+            AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
         },
         System::{
@@ -1635,6 +1730,7 @@ fn capture_loopback_to_wav(
         },
     };
 
+    let mut ready_sender = Some(ready_sender);
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
@@ -1663,6 +1759,31 @@ fn capture_loopback_to_wav(
                 return Err("Windows returned an invalid audio block alignment.".to_string());
             }
 
+            // Keep-alive silent render stream: keeps Windows WASAPI audio engine mixer active
+            // even when no other applications are playing sound.
+            let keepalive_render: Option<(IAudioClient, IAudioRenderClient, u32)> = (|| {
+                let client: IAudioClient = device.Activate(CLSCTX_ALL, None).ok()?;
+                client
+                    .Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        0,
+                        1_000_000,
+                        0,
+                        mix_format,
+                        None,
+                    )
+                    .ok()?;
+                let render_service: IAudioRenderClient = client.GetService().ok()?;
+                let buffer_frames = client.GetBufferSize().ok()?;
+                let data = render_service.GetBuffer(buffer_frames).ok()?;
+                std::ptr::write_bytes(data, 0, buffer_frames as usize * frame_bytes);
+                render_service
+                    .ReleaseBuffer(buffer_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)
+                    .ok()?;
+                client.Start().ok()?;
+                Some((client, render_service, buffer_frames))
+            })();
+
             audio_client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
@@ -1685,14 +1806,44 @@ fn capture_loopback_to_wav(
             .to_vec();
             write_wave_header(&mut file, &format_bytes, 0)?;
 
+            let start_instant = Instant::now();
             audio_client.Start().map_err(|error| error.to_string())?;
+            if let Some(sender) = ready_sender.take() {
+                let _ = sender.send(Ok(start_instant));
+            }
+
+            let sample_rate = format.nSamplesPerSec as u64;
+            let mut total_frames_written: u64 = 0;
+            // The endpoint's device position can predate this capture stream.
+            // Anchor the file timeline to the first packet instead of turning
+            // that pre-existing device time into leading silence.
+            let mut next_device_position: Option<u64> = None;
             let mut data_bytes: u32 = 0;
-            while !stop.load(Ordering::SeqCst) {
+
+            loop {
+                // Top up silent keep-alive buffer if running
+                if let Some((ref render_cl, ref render_srv, buf_size)) = keepalive_render {
+                    if let Ok(padding) = render_cl.GetCurrentPadding() {
+                        let to_write = buf_size.saturating_sub(padding);
+                        if to_write > 0 {
+                            if let Ok(data) = render_srv.GetBuffer(to_write) {
+                                std::ptr::write_bytes(data, 0, to_write as usize * frame_bytes);
+                                let _ = render_srv
+                                    .ReleaseBuffer(to_write, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                            }
+                        }
+                    }
+                }
+
                 let mut next_packet_frames = capture_client
                     .GetNextPacketSize()
                     .map_err(|error| error.to_string())?;
+
                 if next_packet_frames == 0 {
-                    Sleep(10);
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    Sleep(5);
                     continue;
                 }
 
@@ -1700,20 +1851,56 @@ fn capture_loopback_to_wav(
                     let mut data = null_mut();
                     let mut frames = 0u32;
                     let mut flags = Default::default();
+                    let mut device_position = 0_u64;
+                    let mut _qpc_position = 0_u64;
                     capture_client
-                        .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
+                        .GetBuffer(
+                            &mut data,
+                            &mut frames,
+                            &mut flags,
+                            Some(&mut device_position),
+                            Some(&mut _qpc_position),
+                        )
                         .map_err(|error| error.to_string())?;
-                    let bytes = frames as usize * frame_bytes;
+
+                    let timestamp_valid =
+                        (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32) == 0;
+                    let (gap_frames, overlap_frames, following_device_position) =
+                        capture_packet_alignment(
+                            next_device_position,
+                            device_position,
+                            frames,
+                            timestamp_valid,
+                        );
+                    if gap_frames > 0 {
+                        write_silence_frames(
+                            &mut file,
+                            frame_bytes,
+                            gap_frames,
+                            sample_rate,
+                            &mut data_bytes,
+                        )?;
+                        total_frames_written = total_frames_written.saturating_add(gap_frames);
+                    }
+
+                    let writable_frames = frames as u64 - overlap_frames;
+                    let bytes = writable_frames as usize * frame_bytes;
                     if bytes > 0 {
                         if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
                             file.write_all(&vec![0u8; bytes])
                                 .map_err(|error| error.to_string())?;
                         } else {
-                            file.write_all(slice::from_raw_parts(data.cast::<u8>(), bytes))
+                            let byte_offset = overlap_frames as usize * frame_bytes;
+                            file.write_all(slice::from_raw_parts(
+                                data.cast::<u8>().add(byte_offset),
+                                bytes,
+                            ))
                                 .map_err(|error| error.to_string())?;
                         }
                         data_bytes = data_bytes.saturating_add(bytes as u32);
+                        total_frames_written = total_frames_written.saturating_add(writable_frames);
                     }
+                    next_device_position = following_device_position;
                     capture_client
                         .ReleaseBuffer(frames)
                         .map_err(|error| error.to_string())?;
@@ -1723,7 +1910,24 @@ fn capture_loopback_to_wav(
                 }
             }
 
+            // All queued packets have been drained. Wall-clock padding is safe
+            // only now, because no delayed packet can overlap the inserted tail.
+            let final_elapsed = start_instant.elapsed().as_secs_f64();
+            let final_expected = (final_elapsed * sample_rate as f64) as u64;
+            if final_expected > total_frames_written {
+                write_silence_frames(
+                    &mut file,
+                    frame_bytes,
+                    final_expected - total_frames_written,
+                    sample_rate,
+                    &mut data_bytes,
+                )?;
+            }
+
             let _ = audio_client.Stop();
+            if let Some((render_cl, _, _)) = keepalive_render {
+                let _ = render_cl.Stop();
+            }
             finalize_wave_header(&mut file, data_bytes)?;
             CoTaskMemFree(Some(mix_format.cast()));
             if data_bytes == 0 {
@@ -1733,9 +1937,67 @@ fn capture_loopback_to_wav(
                 Ok(Some(path))
             }
         })();
+        if let Some(sender) = ready_sender.take() {
+            let error = result
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_else(|| "System audio capture stopped before startup completed.".to_string());
+            let _ = sender.send(Err(error));
+        }
         CoUninitialize();
         result
     }
+}
+
+fn write_silence_frames(
+    file: &mut fs::File,
+    frame_bytes: usize,
+    frames: u64,
+    sample_rate: u64,
+    data_bytes: &mut u32,
+) -> Result<(), String> {
+    let chunk_frames = sample_rate.max(1);
+    let silence = vec![0_u8; chunk_frames as usize * frame_bytes];
+    let mut remaining = frames;
+    while remaining > 0 {
+        let frames_now = remaining.min(chunk_frames);
+        let bytes_now = frames_now as usize * frame_bytes;
+        file.write_all(&silence[..bytes_now])
+            .map_err(|error| error.to_string())?;
+        *data_bytes = data_bytes.saturating_add(bytes_now as u32);
+        remaining -= frames_now;
+    }
+    Ok(())
+}
+
+fn capture_packet_alignment(
+    next_device_position: Option<u64>,
+    packet_device_position: u64,
+    packet_frames: u32,
+    timestamp_valid: bool,
+) -> (u64, u64, Option<u64>) {
+    let Some(next_device_position) = next_device_position else {
+        let following_device_position = timestamp_valid
+            .then(|| packet_device_position.saturating_add(packet_frames as u64));
+        return (0, 0, following_device_position);
+    };
+    if !timestamp_valid {
+        return (
+            0,
+            0,
+            Some(next_device_position.saturating_add(packet_frames as u64)),
+        );
+    }
+
+    let gap_frames = packet_device_position.saturating_sub(next_device_position);
+    let overlap_frames = next_device_position
+        .saturating_sub(packet_device_position)
+        .min(packet_frames as u64);
+    let following_device_position = next_device_position.max(
+        packet_device_position.saturating_add(packet_frames as u64),
+    );
+    (gap_frames, overlap_frames, Some(following_device_position))
 }
 
 fn write_wave_header(
@@ -1787,6 +2049,7 @@ fn mux_recording_audio(
     ffmpeg_path: &str,
     video_path: &Path,
     audio_path: &Path,
+    audio_lead_seconds: f64,
 ) -> Result<(), String> {
     if fs::metadata(audio_path)
         .map(|metadata| metadata.len())
@@ -1797,11 +2060,16 @@ fn mux_recording_audio(
         return Ok(());
     }
     let muxed = video_path.with_file_name(format!("quickclipper-muxed-{}.mp4", timestamp()));
-    let args = [
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-y".to_string(),
         "-i".to_string(),
         video_path.to_string_lossy().to_string(),
+    ];
+    if audio_lead_seconds > 0.000_5 {
+        args.extend(["-ss".to_string(), seconds(audio_lead_seconds)]);
+    }
+    args.extend([
         "-i".to_string(),
         audio_path.to_string_lossy().to_string(),
         "-map".to_string(),
@@ -1813,14 +2081,16 @@ fn mux_recording_audio(
         "-c:a".to_string(),
         "aac".to_string(),
         "-b:a".to_string(),
-        "128k".to_string(),
+        "320k".to_string(),
+        "-af".to_string(),
+        "apad".to_string(),
         "-shortest".to_string(),
         "-avoid_negative_ts".to_string(),
         "make_zero".to_string(),
         "-movflags".to_string(),
         "+faststart".to_string(),
         muxed.to_string_lossy().to_string(),
-    ];
+    ]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run_command(ffmpeg_path, &refs, "Audio mux failed")?;
     fs::copy(&muxed, video_path).map_err(|error| error.to_string())?;
@@ -1841,6 +2111,8 @@ using System.Runtime.InteropServices;
 public static class NativeWindowStyles {
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
   [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, UInt32 uFlags);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
   [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 }
@@ -1879,19 +2151,43 @@ foreach ($panel in @(
   $edge.Bounds = New-Object System.Drawing.Rectangle -ArgumentList $panel.X, $panel.Y, $panel.W, $panel.H
   $window.Controls.Add($edge)
 }
+$script:HWND_TOPMOST = [IntPtr](-1)
+$script:SWP_NOSIZE = 0x0001
+$script:SWP_NOMOVE = 0x0002
+$script:SWP_NOACTIVATE = 0x0010
+$script:SWP_FRAMECHANGED = 0x0020
+$script:SWP_SHOWWINDOW = 0x0040
+$script:SWP_NOOWNERZORDER = 0x0200
+$script:SW_SHOWNOACTIVATE = 4
+function Set-OverlayTopMost {
+  if ($window -and -not $window.IsDisposed -and $window.IsHandleCreated) {
+    [NativeWindowStyles]::ShowWindow($window.Handle, $script:SW_SHOWNOACTIVATE) | Out-Null
+    $flags = [uint32]($script:SWP_NOSIZE -bor $script:SWP_NOMOVE -bor $script:SWP_NOACTIVATE -bor $script:SWP_SHOWWINDOW -bor $script:SWP_NOOWNERZORDER)
+    [NativeWindowStyles]::SetWindowPos($window.Handle, $script:HWND_TOPMOST, 0, 0, 0, 0, $flags) | Out-Null
+  }
+}
 $started = [DateTime]::Now
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 250
+$timer.Interval = 100
 $timer.Add_Tick({
   $elapsed = [DateTime]::Now - $started
   if ($elapsed.TotalHours -ge 1) { $timerText.Text = $elapsed.ToString('hh\:mm\:ss') } else { $timerText.Text = $elapsed.ToString('mm\:ss') }
+  Set-OverlayTopMost
 })
 $window.Add_Shown({
   $hwnd = $window.Handle
   $style = [NativeWindowStyles]::GetWindowLong($hwnd, -20)
-  [NativeWindowStyles]::SetWindowLong($hwnd, -20, $style -bor 0x20 -bor 0x80000) | Out-Null
+  # WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE.
+  # This keeps the overlay click-through, out of Alt-Tab, and unable to lose
+  # focus on behalf of the application beneath it.
+  [NativeWindowStyles]::SetWindowLong($hwnd, -20, $style -bor 0x20 -bor 0x80 -bor 0x80000 -bor 0x08000000) | Out-Null
+  $frameFlags = [uint32]($script:SWP_NOSIZE -bor $script:SWP_NOMOVE -bor $script:SWP_NOACTIVATE -bor $script:SWP_FRAMECHANGED -bor $script:SWP_SHOWWINDOW -bor $script:SWP_NOOWNERZORDER)
+  [NativeWindowStyles]::SetWindowPos($hwnd, $script:HWND_TOPMOST, 0, 0, 0, 0, $frameFlags) | Out-Null
+  Set-OverlayTopMost
   $timer.Start()
 })
+$window.Add_Deactivate({ Set-OverlayTopMost })
+$window.Add_VisibleChanged({ if ($window.Visible) { Set-OverlayTopMost } })
 $window.Add_Closed({ $timer.Stop() })
 [void]$window.ShowDialog()
 "#
@@ -2140,21 +2436,6 @@ fn target_size_bytes(max_mb: f64) -> u64 {
     (max_mb.max(0.1) * 1024.0 * 1024.0).round() as u64
 }
 
-fn attempt_output_path(output_path: &Path, attempt: usize) -> PathBuf {
-    let parent = output_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let stem = output_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("clip");
-    let extension = output_path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("mp4");
-    parent.join(format!("{}.sizecap-{}.{}", stem, attempt + 1, extension))
-}
 fn choose_audio_wav_profile(settings: &AppSettings, duration: f64) -> AudioWavProfile {
     const PROFILES: [AudioWavProfile; 5] = [
         AudioWavProfile {
@@ -2188,11 +2469,19 @@ fn choose_audio_wav_profile(settings: &AppSettings, duration: f64) -> AudioWavPr
             kbps: 706,
         },
     ];
-    if !settings.size_cap_enabled {
+    let first_profile = match effective_audio_quality(settings) {
+        "best" => 0,
+        "optimized" => 1,
+        _ => 2,
+    };
+    if first_profile == 0 {
         return PROFILES[0];
     }
+    if !settings.size_cap_enabled {
+        return PROFILES[first_profile];
+    }
     let target = target_size_bytes(settings.max_megabytes);
-    PROFILES
+    PROFILES[first_profile..]
         .iter()
         .copied()
         .find(|profile| estimate_audio_wav_bytes(*profile, duration) <= target)
@@ -2201,6 +2490,22 @@ fn choose_audio_wav_profile(settings: &AppSettings, duration: f64) -> AudioWavPr
 
 fn estimate_audio_wav_bytes(profile: AudioWavProfile, duration: f64) -> u64 {
     ((profile.kbps as f64 * 1000.0 / 8.0) * duration.max(0.0) + 4096.0).ceil() as u64
+}
+
+fn attempt_output_path(output_path: &Path, attempt: usize) -> PathBuf {
+    let parent = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = output_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("clip");
+    let extension = output_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mp4");
+    parent.join(format!("{}.sizecap-{}.{}", stem, attempt + 1, extension))
 }
 
 fn cleanup_attempts(paths: &[PathBuf], keep: Option<&Path>) {
@@ -2442,4 +2747,95 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn determine_audio_kbps_matches_profiles() {
+        let mut settings = AppSettings::default();
+        settings.size_cap_enabled = false;
+
+        settings.audio_quality = "optimized".to_string();
+        assert_eq!(determine_audio_kbps(&settings, 10.0, true), 320);
+
+        settings.audio_quality = "best".to_string();
+        assert_eq!(determine_audio_kbps(&settings, 10.0, true), 320);
+
+        settings.audio_quality = "standard".to_string();
+        settings.best_audio = true;
+        assert_eq!(determine_audio_kbps(&settings, 10.0, true), 160);
+
+        settings.audio_quality = "legacy-value".to_string();
+        assert_eq!(determine_audio_kbps(&settings, 10.0, true), 320);
+
+        settings.best_audio = false;
+        assert_eq!(determine_audio_kbps(&settings, 10.0, true), 160);
+
+        assert_eq!(determine_audio_kbps(&settings, 10.0, false), 0);
+
+        // Size cap allocates 320kbps first for optimized if budget allows
+        settings.size_cap_enabled = true;
+        settings.max_megabytes = 10.0;
+        settings.audio_quality = "optimized".to_string();
+        assert_eq!(determine_audio_kbps(&settings, 10.0, true), 320);
+    }
+
+    #[test]
+    fn app_settings_deserializes_missing_audio_quality() {
+        let json = r#"{"saveFolder":"C:\\","ffmpegPath":"ffmpeg","frameRate":30,"maxMegabytes":10.0,"sizeCapEnabled":true,"qualityTargetKbps":10000,"exportEncoderKey":"x264-medium","exportBitrateScale":1.0,"audioGainDb":0.0,"unsupportedEncoderKeys":[],"encoderBenchmarks":[],"includeVideo":true,"includeAudio":true,"audioDeviceName":"","startWithWindows":true,"startHiddenInTray":true,"recordHotkey":"Super+Shift+R","resetHotkey":"Super+Shift+4","githubRepositoryUrl":""}"#;
+        let settings: AppSettings = serde_json::from_str(json).expect("deserialize AppSettings");
+        assert_eq!(settings.audio_quality, "best");
+        assert!(settings.best_audio);
+    }
+
+    #[test]
+    fn wav_profiles_match_the_quality_selection() {
+        let mut settings = AppSettings::default();
+        settings.size_cap_enabled = false;
+
+        settings.audio_quality = "best".to_string();
+        let best = choose_audio_wav_profile(&settings, 60.0);
+        assert_eq!((best.codec, best.sample_rate, best.channels), ("pcm_s24le", 48_000, 2));
+
+        settings.audio_quality = "optimized".to_string();
+        let optimized = choose_audio_wav_profile(&settings, 60.0);
+        assert_eq!(
+            (optimized.codec, optimized.sample_rate, optimized.channels),
+            ("pcm_s16le", 48_000, 2)
+        );
+
+        settings.audio_quality = "standard".to_string();
+        let standard = choose_audio_wav_profile(&settings, 60.0);
+        assert_eq!(
+            (standard.codec, standard.sample_rate, standard.channels),
+            ("pcm_s16le", 44_100, 2)
+        );
+    }
+
+    #[test]
+    fn capture_packet_alignment_preserves_device_timeline() {
+        assert_eq!(
+            capture_packet_alignment(Some(1_000), 1_100, 50, true),
+            (100, 0, Some(1_150))
+        );
+        assert_eq!(
+            capture_packet_alignment(Some(1_000), 950, 100, true),
+            (0, 50, Some(1_050))
+        );
+        assert_eq!(
+            capture_packet_alignment(Some(1_000), 0, 50, false),
+            (0, 0, Some(1_050))
+        );
+        assert_eq!(
+            capture_packet_alignment(None, 168_000, 480, true),
+            (0, 0, Some(168_480))
+        );
+        assert_eq!(
+            capture_packet_alignment(None, 0, 480, false),
+            (0, 0, None)
+        );
+    }
 }

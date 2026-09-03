@@ -138,6 +138,29 @@ textarea {
   padding: 0 8px;
 }
 
+.top-select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  border: 1px solid #30343d;
+  border-radius: 6px;
+  background: #1d2027;
+  color: #d7dde7;
+  font-size: 12px;
+  padding: 0 6px;
+  cursor: pointer;
+  outline: none;
+}
+
+.top-select:hover {
+  border-color: #434956;
+}
+
+.top-select:focus {
+  border-color: #5d6679;
+}
+
 .has-tooltip:hover::after {
   position: absolute;
   right: 0;
@@ -283,7 +306,7 @@ textarea {
 .viewer-toolbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   border-bottom: 1px solid #292d35;
   background: #191c22;
   padding: 0 8px;
@@ -324,6 +347,7 @@ textarea {
 }
 
 .viewer-title {
+  margin-right: 8px;
   color: #9aa4b3;
   font-size: 12px;
   font-weight: 700;

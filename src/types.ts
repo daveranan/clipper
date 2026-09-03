@@ -12,6 +12,8 @@ export type AppSettings = {
   encoderBenchmarks: EncoderBenchmark[]
   includeVideo: boolean
   includeAudio: boolean
+  bestAudio: boolean
+  audioQuality: 'optimized' | 'best' | 'standard'
   audioDeviceName: string
   startWithWindows: boolean
   startHiddenInTray: boolean

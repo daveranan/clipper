@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { emit, listen } from '@tauri-apps/api/event'
@@ -51,6 +51,7 @@ import type { WaveformPeakData } from '@/types'
 import {
   actualSizeViewer,
   canvasBackingSize,
+  clampCropRect,
   fitViewer,
   initialViewerView,
   panViewer,
@@ -61,6 +62,7 @@ import {
   zoomViewerAt,
 } from '@/viewerGeometry'
 import type { ViewerPoint, ViewerSize, ViewerView } from '@/viewerGeometry'
+import { adjacentSourceFrame, cachedPreviewIndex, isCurrentFrameRequest, isFrameAtTime } from '@/viewerMedia'
 
 const defaultSettings: AppSettings = {
   saveFolder: '',
@@ -318,7 +320,7 @@ function MainApp() {
       cancelAnimationFrame(frame)
       media?.pause()
     }
-  }, [clip, cuts, isPlaying, trimEnd])
+  }, [clip, cuts, isPlaying, trimEnd, trimStart])
 
   const previewSrc = useMemo(() => {
     // C-scrub keeps the still mounted: it resolves to the preview-cache frame
@@ -333,8 +335,8 @@ function MainApp() {
     if (!preview || preview.frames.length === 0) {
       return null
     }
-    const index = Math.round(currentTime * preview.fps)
-    if (index < 0 || index >= preview.frames.length) {
+    const index = cachedPreviewIndex(currentTime, preview.fps, preview.frames.length)
+    if (index === null) {
       return null
     }
     return convertFileSrc(preview.frames[index])
@@ -431,7 +433,7 @@ function MainApp() {
       videoDrawable &&
       video !== null &&
       !video.seeking &&
-      Math.abs(video.currentTime - currentTimeRef.current) <= Math.max(1 / Math.max(1, settings.frameRate), 0.01)
+      isFrameAtTime(video.currentTime, currentTimeRef.current, settings.frameRate)
     const paint = (source: CanvasImageSource) => {
       const view = viewerViewRef.current
       const backingScaleX = canvas.width / Math.max(1, viewportSize.width)
@@ -763,11 +765,6 @@ function MainApp() {
     editHistoryRef.current.activeLabel = null
   }
 
-  const resetEditHistory = () => {
-    editHistoryRef.current = { past: [], future: [], activeLabel: null }
-    refreshHistoryState()
-  }
-
   const undoEdit = () => {
     const history = editHistoryRef.current
     const previous = history.past[history.past.length - 1]
@@ -829,7 +826,8 @@ function MainApp() {
       setAutoFit720(false)
       setTimelineZoom(1)
       setTimelineStart(0)
-      resetEditHistory()
+      editHistoryRef.current = { past: [], future: [], activeLabel: null }
+      refreshHistoryState()
       setStatus('Preparing preview cache')
       setIsPreparing(true)
       setIsGeneratingWaveform(true)
@@ -889,23 +887,28 @@ function MainApp() {
       }
       const clipEpoch = clipEpochRef.current
       const requestId = ++frameRequestRef.current
+      const request = { clipEpoch, requestId, secondsAt: time }
+      setExactFrame(null)
       try {
         const path = await tauriInvoke<string>('extract_exact_frame', {
           inputPath: clip.path,
           secondsAt: time,
           settings,
         })
-        if (clipEpoch === clipEpochRef.current && requestId === frameRequestRef.current) {
+        if (isCurrentFrameRequest(request, clipEpochRef.current, frameRequestRef.current, currentTimeRef.current, settings.frameRate)) {
           setExactFrame(path)
         }
       } catch (error) {
-        if (clipEpoch === clipEpochRef.current && requestId === frameRequestRef.current) {
+        if (isCurrentFrameRequest(request, clipEpochRef.current, frameRequestRef.current, currentTimeRef.current, settings.frameRate)) {
           setStatus(shortError(error))
         }
       }
     },
     [clip, settings],
   )
+  const requestExactFrameFromKey = useEffectEvent((time: number) => {
+    void showExactFrame(time)
+  })
 
   const openVideo = async () => {
     setStatus('Opening video')
@@ -1218,17 +1221,16 @@ function MainApp() {
   const seekTimeline = (timelineSeconds: number, exact = false) => {
     seek(timelineToSourceTime(snapTimelineTime(timelineSeconds), videoClipSegments), exact)
   }
+  const seekTimelineFromScrub = useEffectEvent((timelineSeconds: number) => {
+    seekTimeline(timelineSeconds)
+  })
 
   const stepFrame = (direction: -1 | 1, exact = true) => {
     if (!clip || videoClipSegments.length === 0) {
       return
     }
     setIsPlaying(false)
-    const frameSeconds = 1 / Math.max(1, settings.frameRate)
-    const bounds = timelineClipBounds(videoClipSegments)
-    const currentTimeline = sourceToTimelineTime(currentTimeRef.current, videoClipSegments)
-    const nextTimeline = clamp(currentTimeline + direction * frameSeconds, bounds.start, bounds.end)
-    const nextSource = timelineToSourceTime(nextTimeline, videoClipSegments)
+    const nextSource = adjacentSourceFrame(currentTimeRef.current, direction, settings.frameRate, videoClipSegments)
     previewSourceTime(nextSource, exact)
     if (!exact) {
       setIsTimelinePreviewing(true)
@@ -1424,6 +1426,13 @@ function MainApp() {
     }
   })
 
+  const undoEditFromKey = useEffectEvent(undoEdit)
+  const redoEditFromKey = useEffectEvent(redoEdit)
+  const deleteSelectedClipFromKey = useEffectEvent(deleteSelectedClip)
+  const stepFrameFromKey = useEffectEvent(stepFrame)
+  const togglePlaybackFromKey = useEffectEvent(togglePlayback)
+  const toggleCutFromKey = useEffectEvent(toggleCut)
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
@@ -1465,40 +1474,40 @@ function MainApp() {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
         event.preventDefault()
         if (event.shiftKey) {
-          redoEdit()
+          redoEditFromKey()
         } else {
-          undoEdit()
+          undoEditFromKey()
         }
         return
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'y') {
         event.preventDefault()
-        redoEdit()
+        redoEditFromKey()
         return
       }
       if (event.code === 'Space') {
         event.preventDefault()
-        togglePlayback()
+        togglePlaybackFromKey()
         return
       }
       if (event.key === 'ArrowLeft') {
         event.preventDefault()
-        stepFrame(-1, !event.repeat)
+        stepFrameFromKey(-1, !event.repeat)
         return
       }
       if (event.key === 'ArrowRight') {
         event.preventDefault()
-        stepFrame(1, !event.repeat)
+        stepFrameFromKey(1, !event.repeat)
         return
       }
       if (event.key === 'Delete' || event.key === 'Backspace') {
         event.preventDefault()
-        deleteSelectedClip()
+        deleteSelectedClipFromKey()
         return
       }
       if (event.key.toLowerCase() === 'x') {
         event.preventDefault()
-        toggleCut()
+        toggleCutFromKey()
       }
       if (event.key.toLowerCase() === 'c' && !event.repeat) {
         event.preventDefault()
@@ -1511,7 +1520,7 @@ function MainApp() {
         if (exactFrameAfterStepRef.current) {
           exactFrameAfterStepRef.current = false
           setIsTimelinePreviewing(false)
-          void showExactFrame(currentTimeRef.current)
+          requestExactFrameFromKey(currentTimeRef.current)
         }
         return
       }
@@ -1526,7 +1535,7 @@ function MainApp() {
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
     }
-  }, [clip, exitViewerFullscreen, isViewerFullscreen, resetViewer, settingsOpen, showViewerActualSize, stepFrame, toggleCut, togglePlayback, toggleViewerFullscreen, zoomViewerBy])
+  }, [clip, exitViewerFullscreen, isViewerFullscreen, resetViewer, settingsOpen, showViewerActualSize, toggleViewerFullscreen, zoomViewerBy])
 
   const secondsFromTimelinePointer = (element: HTMLElement, clientX: number, bounded = true) => {
     const rect = element.getBoundingClientRect()
@@ -1659,7 +1668,10 @@ function MainApp() {
       if (!clip || !surface || !cScrubModeRef.current || settingsOpen) {
         return
       }
-      seekTimeline(secondsFromTimelinePointer(surface, event.clientX))
+      const rect = surface.getBoundingClientRect()
+      const x = clamp(event.clientX - rect.left, 0, rect.width)
+      const timelineSeconds = timelineViewport.start + (x / Math.max(1, rect.width)) * timelineViewport.span
+      seekTimelineFromScrub(timelineSeconds)
     }
     const onBlur = () => {
       cScrubModeRef.current = false
@@ -1671,7 +1683,7 @@ function MainApp() {
       window.removeEventListener('pointermove', onPointerMove)
       window.removeEventListener('blur', onBlur)
     }
-  }, [clip, settingsOpen, timelineViewport, videoClipSegments])
+  }, [clip, settingsOpen, timelineViewport])
 
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
@@ -3020,16 +3032,6 @@ function timelineHasClipAt(timelineSeconds: number, clips: DisplayClip[]) {
   return clips.some((clip) => timelineSeconds >= clip.start && timelineSeconds <= clip.end)
 }
 
-function timelineClipBounds(clips: DisplayClip[]) {
-  if (clips.length === 0) {
-    return { start: 0, end: 0 }
-  }
-  return {
-    start: clips[0].start,
-    end: clips[clips.length - 1].end,
-  }
-}
-
 function sourceEndForKeptDuration(clips: DisplayClip[], maxSeconds: number) {
   if (clips.length === 0) {
     return 0
@@ -3069,48 +3071,11 @@ function marqueeSelectionStyle(selection: NonNullable<MarqueeSelection>) {
 }
 
 function clampCrop(crop: Crop, sourceWidth: number, sourceHeight: number) {
-  const width = makeEven(clamp(crop.width, 8, sourceWidth))
-  const height = makeEven(clamp(crop.height, 8, sourceHeight))
-  return {
-    x: clamp(crop.x, 0, Math.max(0, sourceWidth - width)),
-    y: clamp(crop.y, 0, Math.max(0, sourceHeight - height)),
-    width,
-    height,
-  }
+  return clampCropRect(crop, { width: sourceWidth, height: sourceHeight })
 }
 
 function clampCropForDrag(crop: Crop, sourceWidth: number, sourceHeight: number, mode: 'move' | 'tl' | 'tr' | 'bl' | 'br') {
-  if (mode === 'move') {
-    return clampCrop(crop, sourceWidth, sourceHeight)
-  }
-  let left = crop.x
-  let top = crop.y
-  let right = crop.x + crop.width
-  let bottom = crop.y + crop.height
-  left = clamp(left, 0, sourceWidth - 8)
-  top = clamp(top, 0, sourceHeight - 8)
-  right = clamp(right, 8, sourceWidth)
-  bottom = clamp(bottom, 8, sourceHeight)
-  if (right - left < 8) {
-    if (mode === 'tr' || mode === 'br') {
-      right = clamp(left + 8, 8, sourceWidth)
-    } else {
-      left = clamp(right - 8, 0, sourceWidth - 8)
-    }
-  }
-  if (bottom - top < 8) {
-    if (mode === 'bl' || mode === 'br') {
-      bottom = clamp(top + 8, 8, sourceHeight)
-    } else {
-      top = clamp(bottom - 8, 0, sourceHeight - 8)
-    }
-  }
-  return {
-    x: Math.round(left),
-    y: Math.round(top),
-    width: makeEven(right - left),
-    height: makeEven(bottom - top),
-  }
+  return clampCropRect(crop, { width: sourceWidth, height: sourceHeight }, mode)
 }
 
 function cropForAspect(sourceWidth: number, sourceHeight: number, aspect: number) {

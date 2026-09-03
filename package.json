@@ -8,7 +8,8 @@
     "tauri": "tauri",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "test:viewer": "node --test tests/viewerGeometry.test.ts",
+    "test:viewer": "node --test \"tests/*.test.ts\"",
+    "test:acceptance": "npm run test:viewer && cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "preview": "vite preview"
   },
   "dependencies": {

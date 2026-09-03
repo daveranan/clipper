@@ -2377,6 +2377,9 @@ fn should_start_hidden_in_tray() -> bool {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(test)]
+mod canvas_acceptance_tests;
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState {

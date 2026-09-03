@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   actualSizeViewer,
   canvasBackingSize,
+  clampCropRect,
   fitViewer,
   resizeViewer,
   resizeRectWithLockedAspect,
@@ -81,4 +82,43 @@ test('Shift-locked corner resize preserves ratio and the opposite corner', () =>
   assert.equal(resized.x + resized.width, initial.x + initial.width)
   assert.equal(resized.y + resized.height, initial.y + initial.height)
   assert.ok(Math.abs(resized.width / resized.height - initial.width / initial.height) < 0.01)
+})
+
+test('crop interactions stay source-accurate across the zoom acceptance matrix', () => {
+  const source = { width: 1920, height: 1080 }
+  const crop = { x: 200, y: 100, width: 1280, height: 720 }
+  for (const scale of [0.25, 1, 2, 4]) {
+    const view = { mode: 'custom' as const, scale, offsetX: 37, offsetY: -19 }
+    const start = sourceToViewport({ x: 500, y: 300 }, view)
+    const end = { x: start.x + 40 * scale, y: start.y + 20 * scale }
+    const sourceStart = viewportToSource(start, view)
+    const sourceEnd = viewportToSource(end, view)
+    const moved = clampCropRect({
+      ...crop,
+      x: crop.x + (sourceEnd.x - sourceStart.x),
+      y: crop.y + (sourceEnd.y - sourceStart.y),
+    }, source)
+    assert.deepEqual(moved, { x: 240, y: 120, width: 1280, height: 720 })
+  }
+})
+
+test('crop move and every corner remain bounded, even, and at least eight pixels', () => {
+  const bounds = { width: 1919, height: 1079 }
+  const cases = [
+    clampCropRect({ x: 1901, y: 1061, width: 320, height: 180 }, bounds),
+    clampCropRect({ x: -50, y: -50, width: 2, height: 2 }, bounds, 'tl'),
+    clampCropRect({ x: 100, y: -50, width: 4000, height: 2 }, bounds, 'tr'),
+    clampCropRect({ x: -50, y: 100, width: 2, height: 4000 }, bounds, 'bl'),
+    clampCropRect({ x: 100, y: 100, width: 4000, height: 4000 }, bounds, 'br'),
+  ]
+  for (const crop of cases) {
+    assert.ok(crop.x >= 0 && crop.y >= 0)
+    assert.ok(crop.width >= 8 && crop.height >= 8)
+    assert.ok(crop.x + crop.width <= 1918)
+    assert.ok(crop.y + crop.height <= 1078)
+    assert.equal(crop.x % 2, 0)
+    assert.equal(crop.y % 2, 0)
+    assert.equal(crop.width % 2, 0)
+    assert.equal(crop.height % 2, 0)
+  }
 })

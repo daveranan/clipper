@@ -177,3 +177,57 @@ export function resizeRectWithLockedAspect(
     height,
   }
 }
+
+const evenFloor = (value: number) => {
+  const integer = Math.max(0, Math.floor(Number.isFinite(value) ? value : 0))
+  return integer - (integer % 2)
+}
+
+/**
+ * Applies the same even-pixel crop constraints used by the FFmpeg export path.
+ * Keeping this normalization in the interaction layer prevents the inspector
+ * from promising coordinates that the exporter would silently alter.
+ */
+export function clampCropRect(
+  rect: ViewerRect,
+  bounds: ViewerSize,
+  mode: 'move' | ViewerCorner = 'move',
+  minimumSize = 8,
+): ViewerRect {
+  const maxRight = Math.max(2, evenFloor(bounds.width))
+  const maxBottom = Math.max(2, evenFloor(bounds.height))
+  const minimum = Math.max(2, evenFloor(minimumSize))
+  const width = Math.min(maxRight, Math.max(minimum, evenFloor(rect.width)))
+  const height = Math.min(maxBottom, Math.max(minimum, evenFloor(rect.height)))
+
+  if (mode === 'move') {
+    return {
+      x: Math.min(maxRight - width, evenFloor(rect.x)),
+      y: Math.min(maxBottom - height, evenFloor(rect.y)),
+      width,
+      height,
+    }
+  }
+
+  const movesLeft = mode === 'tl' || mode === 'bl'
+  const movesTop = mode === 'tl' || mode === 'tr'
+  const rawFixedX = evenFloor(movesLeft ? rect.x + rect.width : rect.x)
+  const rawFixedY = evenFloor(movesTop ? rect.y + rect.height : rect.y)
+  const fixedX = movesLeft
+    ? Math.min(maxRight, Math.max(minimum, rawFixedX))
+    : Math.min(maxRight - minimum, rawFixedX)
+  const fixedY = movesTop
+    ? Math.min(maxBottom, Math.max(minimum, rawFixedY))
+    : Math.min(maxBottom - minimum, rawFixedY)
+  const availableWidth = movesLeft ? fixedX : maxRight - fixedX
+  const availableHeight = movesTop ? fixedY : maxBottom - fixedY
+  const resizedWidth = Math.min(Math.max(minimum, width), Math.max(minimum, availableWidth))
+  const resizedHeight = Math.min(Math.max(minimum, height), Math.max(minimum, availableHeight))
+
+  return {
+    x: movesLeft ? fixedX - resizedWidth : fixedX,
+    y: movesTop ? fixedY - resizedHeight : fixedY,
+    width: resizedWidth,
+    height: resizedHeight,
+  }
+}

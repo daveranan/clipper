@@ -33,6 +33,15 @@ struct ActiveRecording {
     path: PathBuf,
 }
 
+impl Drop for AppState {
+    fn drop(&mut self) {
+        let active = self.recording.get_mut().ok().and_then(Option::take);
+        if let Some(mut recording) = active {
+            terminate_active_recording(&mut recording);
+        }
+    }
+}
+
 struct LoopbackRecording {
     stop: Arc<AtomicBool>,
     thread: thread::JoinHandle<Result<Option<PathBuf>, String>>,
@@ -1349,7 +1358,8 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
         return Err(format!("Recording failed to start: {}", stderr.trim()));
     }
 
-    let overlay_child = start_recording_overlay(request.x, request.y, width, height).ok();
+    let overlay_child =
+        start_recording_overlay(std::process::id(), request.x, request.y, width, height).ok();
     Ok(ActiveRecording {
         child,
         overlay_child,
@@ -2099,8 +2109,9 @@ fn mux_recording_audio(
     Ok(())
 }
 
-fn start_recording_overlay(x: i32, y: i32, width: u32, height: u32) -> Result<Child, String> {
+fn start_recording_overlay(parent_pid: u32, x: i32, y: i32, width: u32, height: u32) -> Result<Child, String> {
     let script = r#"
+$ParentPid = __PARENT_PID__
 $X = __X__
 $Y = __Y__
 $W = __W__
@@ -2113,6 +2124,7 @@ public static class NativeWindowStyles {
   [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, UInt32 uFlags);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, UInt32 dwAffinity);
   [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 }
@@ -2121,6 +2133,13 @@ try { [NativeWindowStyles]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Nu
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+$script:parentProcess = $null
+try {
+  $script:parentProcess = [System.Diagnostics.Process]::GetProcessById($ParentPid)
+  $null = $script:parentProcess.Handle
+} catch {
+  exit 0
+}
 $transparent = [System.Drawing.Color]::FromArgb(255, 255, 0, 255)
 $record = [System.Drawing.Color]::FromArgb(229, 72, 77)
 $window = New-Object System.Windows.Forms.Form
@@ -2159,8 +2178,14 @@ $script:SWP_FRAMECHANGED = 0x0020
 $script:SWP_SHOWWINDOW = 0x0040
 $script:SWP_NOOWNERZORDER = 0x0200
 $script:SW_SHOWNOACTIVATE = 4
+$script:WDA_EXCLUDEFROMCAPTURE = [uint32]0x11
+$script:overlayEnabled = $true
+function Test-ParentAlive {
+  if ($null -eq $script:parentProcess) { return $false }
+  try { return -not $script:parentProcess.HasExited } catch { return $false }
+}
 function Set-OverlayTopMost {
-  if ($window -and -not $window.IsDisposed -and $window.IsHandleCreated) {
+  if ($script:overlayEnabled -and $window -and -not $window.IsDisposed -and $window.IsHandleCreated) {
     [NativeWindowStyles]::ShowWindow($window.Handle, $script:SW_SHOWNOACTIVATE) | Out-Null
     $flags = [uint32]($script:SWP_NOSIZE -bor $script:SWP_NOMOVE -bor $script:SWP_NOACTIVATE -bor $script:SWP_SHOWWINDOW -bor $script:SWP_NOOWNERZORDER)
     [NativeWindowStyles]::SetWindowPos($window.Handle, $script:HWND_TOPMOST, 0, 0, 0, 0, $flags) | Out-Null
@@ -2170,6 +2195,10 @@ $started = [DateTime]::Now
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 100
 $timer.Add_Tick({
+  if (-not (Test-ParentAlive)) {
+    $window.Close()
+    return
+  }
   $elapsed = [DateTime]::Now - $started
   if ($elapsed.TotalHours -ge 1) { $timerText.Text = $elapsed.ToString('hh\:mm\:ss') } else { $timerText.Text = $elapsed.ToString('mm\:ss') }
   Set-OverlayTopMost
@@ -2181,6 +2210,14 @@ $window.Add_Shown({
   # This keeps the overlay click-through, out of Alt-Tab, and unable to lose
   # focus on behalf of the application beneath it.
   [NativeWindowStyles]::SetWindowLong($hwnd, -20, $style -bor 0x20 -bor 0x80 -bor 0x80000 -bor 0x08000000) | Out-Null
+  # The overlay is positioned over the capture region, so a desktop capture
+  # would otherwise record its timer and border. Hide it if this Windows
+  # version cannot exclude the window from screen capture.
+  if (-not [NativeWindowStyles]::SetWindowDisplayAffinity($hwnd, $script:WDA_EXCLUDEFROMCAPTURE)) {
+    $script:overlayEnabled = $false
+    $window.Close()
+    return
+  }
   $frameFlags = [uint32]($script:SWP_NOSIZE -bor $script:SWP_NOMOVE -bor $script:SWP_NOACTIVATE -bor $script:SWP_FRAMECHANGED -bor $script:SWP_SHOWWINDOW -bor $script:SWP_NOOWNERZORDER)
   [NativeWindowStyles]::SetWindowPos($hwnd, $script:HWND_TOPMOST, 0, 0, 0, 0, $frameFlags) | Out-Null
   Set-OverlayTopMost
@@ -2188,9 +2225,10 @@ $window.Add_Shown({
 })
 $window.Add_Deactivate({ Set-OverlayTopMost })
 $window.Add_VisibleChanged({ if ($window.Visible) { Set-OverlayTopMost } })
-$window.Add_Closed({ $timer.Stop() })
+$window.Add_Closed({ $timer.Stop(); if ($script:parentProcess) { $script:parentProcess.Dispose() } })
 [void]$window.ShowDialog()
 "#
+    .replace("__PARENT_PID__", &parent_pid.to_string())
     .replace("__X__", &x.to_string())
     .replace("__Y__", &y.to_string())
     .replace("__W__", &width.to_string())
@@ -2213,6 +2251,16 @@ fn stop_recording_overlay(child: &mut Option<Child>) {
         let _ = overlay.kill();
         let _ = overlay.wait();
     }
+}
+
+fn terminate_active_recording(recording: &mut ActiveRecording) {
+    stop_recording_overlay(&mut recording.overlay_child);
+    // AppState is dropped during application shutdown. Do not leave FFmpeg or
+    // the loopback capture thread running after the UI process has exited.
+    let _ = recording.child.kill();
+    let _ = recording.child.wait();
+    let _ = stop_loopback_recording(recording.audio.take());
+    let _ = fs::remove_file(&recording.path);
 }
 
 fn run_command(exe: &str, args: &[&str], label: &str) -> Result<(), String> {

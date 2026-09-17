@@ -21,8 +21,12 @@ use tauri::{
 };
 use uuid::Uuid;
 
+mod export_job;
+use export_job::{ExportControl, ExportJobs};
+
 struct AppState {
     recording: Mutex<Option<ActiveRecording>>,
+    exports: ExportJobs,
 }
 
 struct ActiveRecording {
@@ -232,6 +236,66 @@ struct AudioWavProfile {
     sample_rate: u32,
     channels: u32,
     kbps: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenshotResult {
+    width: u32,
+    height: u32,
+}
+
+#[tauri::command]
+async fn copy_video_frame(input_path: String, seconds_at: f64, settings: AppSettings) -> Result<ScreenshotResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let frame = extract_screenshot(&input_path, seconds_at, &settings)?;
+        let result = ScreenshotResult { width: frame.width(), height: frame.height() };
+        let mut clipboard = arboard::Clipboard::new()
+            .map_err(|error| format!("Could not open clipboard: {error}"))?;
+        clipboard.set_image(arboard::ImageData {
+            width: result.width as usize,
+            height: result.height as usize,
+            bytes: std::borrow::Cow::Owned(frame.into_raw()),
+        }).map_err(|error| format!("Could not copy screenshot: {error}"))?;
+        Ok(result)
+    }).await.map_err(|error| format!("Screenshot worker failed: {error}"))?
+}
+
+fn extract_screenshot(input_path: &str, seconds_at: f64, settings: &AppSettings) -> Result<image::RgbaImage, String> {
+    if !seconds_at.is_finite() {
+        return Err("Invalid screenshot time.".into());
+    }
+    let source = Path::new(input_path);
+    let info = probe_video_file(settings, source, source)?.ok_or("Could not read source video.")?;
+    let time = seconds_at.clamp(0.0, info.duration_seconds);
+    let output = hidden_command(&settings.ffmpeg_path).args([
+        "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-ss", &format!("{time:.6}"), "-i", input_path,
+        "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
+        "-c:v", "png", "-pix_fmt", "rgba", "-f", "image2pipe", "pipe:1",
+    ]).output().map_err(|error| format!("Screenshot failed: {error}"))?;
+    if !output.status.success() {
+        return Err(command_error_message("Screenshot failed", &String::from_utf8_lossy(&output.stderr)));
+    }
+    let png = if output.stdout.is_empty() {
+        // At the end of a clip there may be no frame at or after the playhead.
+        // Decode the tail, retaining its last frame without buffering video in memory.
+        let folder = tempfile::Builder::new().prefix("quickclipper-frame-").tempdir().map_err(|error| error.to_string())?;
+        let path = folder.path().join("last.png");
+        run_command(&settings.ffmpeg_path, &[
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-sseof", "-1", "-noaccurate_seek", "-i", input_path,
+            "-map", "0:v:0", "-an", "-sn", "-dn",
+            "-c:v", "png", "-pix_fmt", "rgba", "-fps_mode", "passthrough", "-update", "1",
+            &path.to_string_lossy(),
+        ], "Screenshot failed")?;
+        fs::read(path).map_err(|_| "No video frame was available at this position.".to_string())?
+    } else {
+        output.stdout
+    };
+    image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .map(|image| image.into_rgba8())
+        .map_err(|error| format!("Could not decode screenshot: {error}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -699,11 +763,22 @@ if ($script:result -and $script:result -ne 'cancel') { Write-Output $script:resu
 }
 
 #[tauri::command]
-async fn export_clip(request: ExportRequest) -> Result<ExportResult, String> {
+fn begin_export(state: State<'_, AppState>) -> Result<String, String> {
+    state.exports.reserve()
+}
+
+#[tauri::command]
+fn cancel_export(job_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    state.exports.cancel(&job_id)
+}
+
+#[tauri::command]
+async fn export_clip(request: ExportRequest, job_id: String, state: State<'_, AppState>) -> Result<ExportResult, String> {
+    let job = state.exports.claim(&job_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let encoder_key = request.settings.export_encoder_key.clone();
         let output_path = request.output_path.clone();
-        export_with_encoder(&request, &encoder_key, &output_path)
+        export_with_encoder(&request, &encoder_key, &output_path, &job.control)
     })
     .await
     .map_err(|error| format!("Export worker failed: {}", error))?
@@ -736,11 +811,32 @@ fn export_with_encoder(
     request: &ExportRequest,
     encoder_key: &str,
     output_path: &str,
+    control: &ExportControl,
+) -> Result<ExportResult, String> {
+    control.check()?;
+    let output = Path::new(output_path);
+    ensure_parent(output)?;
+    let parent = output.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    // Keep attempts on the destination volume, then publish only a complete export.
+    let staging = tempfile::Builder::new().prefix(".quickclipper-export-").tempdir_in(parent)
+        .map_err(|error| error.to_string())?;
+    let staged_path = staging.path().join(output.file_name().ok_or("Invalid export filename")?);
+    let mut result = export_to_path(request, encoder_key, &staged_path.to_string_lossy(), control)?;
+    control.publish(&staged_path, output)?;
+    result.path = output_path.to_string();
+    Ok(result)
+}
+
+fn export_to_path(
+    request: &ExportRequest,
+    encoder_key: &str,
+    output_path: &str,
+    control: &ExportControl,
 ) -> Result<ExportResult, String> {
     let started = Instant::now();
     ensure_parent(Path::new(output_path))?;
     if !request.settings.include_video {
-        let bytes = export_audio_only(request, Path::new(output_path))?;
+        let bytes = export_audio_only(request, Path::new(output_path), control)?;
         return Ok(ExportResult {
             path: output_path.to_string(),
             bytes,
@@ -754,12 +850,12 @@ fn export_with_encoder(
     }
 
     let source_path = Path::new(&request.input_path);
-    let source_info = probe_video_file(&request.settings, source_path, source_path)?
+    let source_info = probe_video_file_with_control(&request.settings, source_path, source_path, control)?
         .ok_or_else(|| "Could not read source video.".to_string())?;
     let source_width = source_info.width;
     let source_height = source_info.height;
     let source_duration = source_info.duration_seconds;
-    let source_has_audio = source_has_audio(&request.settings, source_path);
+    let source_has_audio = source_has_audio_with_control(&request.settings, source_path, control)?;
     let export_crop = clamp_export_crop(&request.crop, source_width, source_height);
 
     let audio_kept = if request.settings.include_audio {
@@ -781,6 +877,7 @@ fn export_with_encoder(
             source_has_audio,
             duration,
             audio_kbps,
+            control,
         )?
     } else if can_copy_source_export(
         request,
@@ -790,10 +887,7 @@ fn export_with_encoder(
         source_duration,
         source_has_audio,
     ) {
-        fs::copy(&request.input_path, output_path).map_err(|error| error.to_string())?;
-        fs::metadata(output_path)
-            .map(|metadata| metadata.len())
-            .map_err(|error| error.to_string())?
+        control.copy(source_path, Path::new(output_path))?
     } else {
         export_once(
             request,
@@ -805,6 +899,7 @@ fn export_with_encoder(
             source_has_audio,
             None,
             audio_kbps,
+            control,
         )?
     };
 
@@ -815,12 +910,12 @@ fn export_with_encoder(
     })
 }
 
-fn export_audio_only(request: &ExportRequest, output_path: &Path) -> Result<u64, String> {
+fn export_audio_only(request: &ExportRequest, output_path: &Path, control: &ExportControl) -> Result<u64, String> {
     if !request.settings.include_audio {
         return Err("Audio-only export needs Audio enabled.".to_string());
     }
     let source_path = Path::new(&request.input_path);
-    if !source_has_audio(&request.settings, source_path) {
+    if !source_has_audio_with_control(&request.settings, source_path, control)? {
         return Err("Source has no audio stream.".to_string());
     }
     let audio_kept = kept_segments(request.audio_start, request.audio_end, &request.audio_cuts);
@@ -835,7 +930,7 @@ fn export_audio_only(request: &ExportRequest, output_path: &Path) -> Result<u64,
     let profile = choose_audio_wav_profile(&request.settings, duration);
     let args = build_audio_only_export_args(request, output_path, &audio_kept, profile, duration);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    if let Err(error) = run_command(&request.settings.ffmpeg_path, &arg_refs, "Audio export failed") {
+    if let Err(error) = control.run(&request.settings.ffmpeg_path, &arg_refs, "Audio export failed") {
         remove_empty_file(output_path);
         return Err(error);
     }
@@ -945,6 +1040,7 @@ fn export_size_capped(
     source_has_audio: bool,
     duration: f64,
     audio_kbps: u32,
+    control: &ExportControl,
 ) -> Result<u64, String> {
     let target_bytes = target_size_bytes(request.settings.max_megabytes);
     let minimum_target_bytes = (target_bytes as f64 * 0.97).round() as u64;
@@ -971,6 +1067,7 @@ fn export_size_capped(
             source_has_audio,
             Some(next_kbps),
             audio_kbps,
+            control,
         ) {
             Ok(bytes) => {
                 let result = ExportAttemptResult {
@@ -1015,8 +1112,10 @@ fn export_size_capped(
         }
     }
 
+    // Cancellation must discard even a successful earlier size-cap attempt.
+    control.check()?;
     if let Some(best) = best_under {
-        fs::copy(&best.path, output_path).map_err(|error| error.to_string())?;
+        control.copy(&best.path, output_path)?;
         cleanup_attempts(&attempts, Some(&best.path));
         return Ok(fs::metadata(output_path)
             .map_err(|error| error.to_string())?
@@ -1046,6 +1145,7 @@ fn export_once(
     source_has_audio: bool,
     video_kbps: Option<u32>,
     audio_kbps: u32,
+    control: &ExportControl,
 ) -> Result<u64, String> {
     let args = build_export_args(
         request,
@@ -1059,7 +1159,7 @@ fn export_once(
         audio_kbps,
     );
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    if let Err(error) = run_command(&request.settings.ffmpeg_path, &arg_refs, "Export failed") {
+    if let Err(error) = control.run(&request.settings.ffmpeg_path, &arg_refs, "Export failed") {
         remove_empty_file(output_path);
         return Err(error);
     }
@@ -1199,13 +1299,14 @@ fn can_copy_source_export(
 }
 
 #[tauri::command]
-async fn benchmark_encoders(request: ExportRequest) -> Result<Vec<BenchmarkResult>, String> {
-    tauri::async_runtime::spawn_blocking(move || benchmark_encoders_sync(request))
+async fn benchmark_encoders(request: ExportRequest, job_id: String, state: State<'_, AppState>) -> Result<Vec<BenchmarkResult>, String> {
+    let job = state.exports.claim(&job_id)?;
+    tauri::async_runtime::spawn_blocking(move || benchmark_encoders_sync(request, &job.control))
         .await
         .map_err(|error| format!("Benchmark worker failed: {}", error))?
 }
 
-fn benchmark_encoders_sync(request: ExportRequest) -> Result<Vec<BenchmarkResult>, String> {
+fn benchmark_encoders_sync(request: ExportRequest, control: &ExportControl) -> Result<Vec<BenchmarkResult>, String> {
     let mut results = Vec::new();
     let output = PathBuf::from(&request.output_path);
     let folder = output
@@ -1218,6 +1319,7 @@ fn benchmark_encoders_sync(request: ExportRequest) -> Result<Vec<BenchmarkResult
         .unwrap_or("benchmark");
 
     for (encoder_key, encoder_label) in encoder_presets() {
+        control.check()?;
         if request
             .settings
             .unsupported_encoder_keys
@@ -1227,7 +1329,7 @@ fn benchmark_encoders_sync(request: ExportRequest) -> Result<Vec<BenchmarkResult
             continue;
         }
         let path = folder.join(format!("{}-{}.mp4", stem, encoder_key));
-        match export_with_encoder(&request, encoder_key, &path.to_string_lossy()) {
+        match export_with_encoder(&request, encoder_key, &path.to_string_lossy(), control) {
             Ok(result) => results.push(BenchmarkResult {
                 encoder_key: encoder_key.to_string(),
                 encoder_label: encoder_label.to_string(),
@@ -1249,6 +1351,7 @@ fn benchmark_encoders_sync(request: ExportRequest) -> Result<Vec<BenchmarkResult
         }
     }
 
+    control.check()?;
     if results.iter().all(|result| !result.success) {
         return Err(results
             .iter()
@@ -1488,8 +1591,17 @@ fn probe_video_file(
     media_path: &Path,
     original_path: &Path,
 ) -> Result<Option<VideoInfo>, String> {
+    probe_video_file_with_control(settings, media_path, original_path, &ExportControl::default())
+}
+
+fn probe_video_file_with_control(
+    settings: &AppSettings,
+    media_path: &Path,
+    original_path: &Path,
+    control: &ExportControl,
+) -> Result<Option<VideoInfo>, String> {
     let ffprobe = sibling_tool(&settings.ffmpeg_path, "ffprobe.exe");
-    let output = hidden_command(&ffprobe)
+    let output = control.output(hidden_command(&ffprobe)
         .args([
             "-v",
             "error",
@@ -1500,9 +1612,7 @@ fn probe_video_file(
             "-of",
             "default=noprint_wrappers=1",
             &media_path.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|error| error.to_string())?;
+        ]), "Could not read video")?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
@@ -1578,9 +1688,9 @@ fn is_browser_safe_playback(settings: &AppSettings, media_path: &Path) -> Result
     Ok(codec == "h264" && pix_fmt == "yuv420p")
 }
 
-fn source_has_audio(settings: &AppSettings, media_path: &Path) -> bool {
+fn source_has_audio_with_control(settings: &AppSettings, media_path: &Path, control: &ExportControl) -> Result<bool, String> {
     let ffprobe = sibling_tool(&settings.ffmpeg_path, "ffprobe.exe");
-    hidden_command(&ffprobe)
+    control.output(hidden_command(&ffprobe)
         .args([
             "-v",
             "error",
@@ -1591,12 +1701,10 @@ fn source_has_audio(settings: &AppSettings, media_path: &Path) -> bool {
             "-of",
             "csv=p=0",
             &media_path.to_string_lossy(),
-        ])
-        .output()
+        ]), "Could not read audio")
         .map(|output| {
             output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
         })
-        .unwrap_or(false)
 }
 
 fn import_to_workspace(source: &Path) -> Result<PathBuf, String> {
@@ -2733,10 +2841,14 @@ fn should_start_hidden_in_tray() -> bool {
 #[cfg(test)]
 mod canvas_acceptance_tests;
 
+#[cfg(test)]
+mod export_capture_tests;
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState {
             recording: Mutex::new(None),
+            exports: ExportJobs::default(),
         })
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -2779,6 +2891,9 @@ pub fn run() {
             generate_waveform,
             open_region_selector,
             export_clip,
+            begin_export,
+            cancel_export,
+            copy_video_frame,
             benchmark_encoders,
             start_recording,
             stop_recording,

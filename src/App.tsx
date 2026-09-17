@@ -10,6 +10,7 @@ import { relaunch } from '@tauri-apps/plugin-process'
 import { check } from '@tauri-apps/plugin-updater'
 import {
   Aperture,
+  Camera,
   ChevronLeft,
   ChevronRight,
   Copy,
@@ -63,6 +64,8 @@ import {
 } from '@/viewerGeometry'
 import type { ViewerPoint, ViewerSize, ViewerView } from '@/viewerGeometry'
 import { adjacentSourceFrame, cachedPreviewIndex, isCurrentFrameRequest, isFrameAtTime } from '@/viewerMedia'
+import { runExportJob } from '@/exportJob'
+import type { ExportOperation } from '@/exportJob'
 
 const defaultSettings: AppSettings = {
   saveFolder: '',
@@ -153,6 +156,10 @@ function MainApp() {
   const [status, setStatus] = useState('Ready')
   const [isPreparing, setIsPreparing] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [isStoppingExport, setIsStoppingExport] = useState(false)
+  const [isCopyingFrame, setIsCopyingFrame] = useState(false)
+  const exportOperationRef = useRef<ExportOperation | null>(null)
+  const copyingFrameRef = useRef(false)
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -978,10 +985,13 @@ function MainApp() {
   }
 
   const exportClip = async () => {
-    if (!clip) {
+    if (!clip || exportOperationRef.current) {
       return
     }
+    const operation: ExportOperation = { jobId: null, stopRequested: false }
+    exportOperationRef.current = operation
     setIsExporting(true)
+    setIsStoppingExport(false)
     setStatus('Exporting')
     try {
       await nextPaint()
@@ -1002,21 +1012,68 @@ function MainApp() {
         audioCuts,
         settings,
       }
-      const result = await tauriInvoke<ExportResult>('export_clip', { request })
+      const result = await runExportJob<ExportResult>(tauriInvoke, operation, 'export_clip', request)
       setLastExport(result)
       setStatus(`Export ready: ${fileName(result.path)} (${formatBytes(result.bytes)}, ${result.seconds.toFixed(1)}s)`)
     } catch (error) {
       setStatus(shortError(error))
     } finally {
+      exportOperationRef.current = null
       setIsExporting(false)
+      setIsStoppingExport(false)
+    }
+  }
+
+  const stopExport = async () => {
+    const operation = exportOperationRef.current
+    if (!operation || operation.stopRequested) return
+    operation.stopRequested = true
+    setIsStoppingExport(true)
+    setStatus('Stopping export')
+    if (!operation.jobId) return
+    try {
+      await tauriInvoke('cancel_export', { jobId: operation.jobId })
+    } catch (error) {
+      if (exportOperationRef.current === operation) {
+        operation.stopRequested = false
+        setIsStoppingExport(false)
+        setStatus(shortError(error))
+      }
+    }
+  }
+
+  const copyVideoFrame = async () => {
+    if (!clip || copyingFrameRef.current) return
+    copyingFrameRef.current = true
+    setIsCopyingFrame(true)
+    const secondsAt = currentTimeRef.current
+    playbackRef.current?.pause()
+    setIsPlaying(false)
+    setCurrentTime(secondsAt)
+    setStatus('Copying full-resolution frame')
+    try {
+      const result = await tauriInvoke<{ width: number; height: number }>('copy_video_frame', {
+        inputPath: clip.path,
+        secondsAt,
+        settings,
+      })
+      setStatus(`Screenshot copied to clipboard (${result.width}×${result.height})`)
+    } catch (error) {
+      setStatus(shortError(error))
+    } finally {
+      copyingFrameRef.current = false
+      setIsCopyingFrame(false)
     }
   }
 
   const benchmarkEncoders = async () => {
-    if (!clip) {
+    if (!clip || exportOperationRef.current) {
       return
     }
+    const operation: ExportOperation = { jobId: null, stopRequested: false }
+    exportOperationRef.current = operation
     setIsExporting(true)
+    setIsStoppingExport(false)
     setStatus('Benchmarking encoders')
     try {
       await nextPaint()
@@ -1043,7 +1100,7 @@ function MainApp() {
         audioCuts,
         settings,
       }
-      const results = await tauriInvoke<BenchmarkResult[]>('benchmark_encoders', { request })
+      const results = await runExportJob<BenchmarkResult[]>(tauriInvoke, operation, 'benchmark_encoders', request)
       setBenchmarkResults(results)
       const successes = results.filter((result) => result.success)
       const unsupported = results.filter((result) => !result.success).map((result) => result.encoderKey)
@@ -1064,7 +1121,9 @@ function MainApp() {
     } catch (error) {
       setStatus(shortError(error))
     } finally {
+      exportOperationRef.current = null
       setIsExporting(false)
+      setIsStoppingExport(false)
     }
   }
 
@@ -1956,10 +2015,17 @@ function MainApp() {
             />
             Size Cap
           </label>
-          <Button variant="primary" disabled={!clip || isExporting} onClick={exportClip}>
-            <Upload />
-            {isExporting ? 'Exporting' : settings.includeVideo ? 'Export' : 'Export WAV'}
-          </Button>
+          {isExporting ? (
+            <Button variant="danger" disabled={isStoppingExport} onClick={stopExport}>
+              <Square />
+              {isStoppingExport ? 'Stopping…' : 'Stop Export'}
+            </Button>
+          ) : (
+            <Button variant="primary" disabled={!clip} onClick={exportClip}>
+              <Upload />
+              {settings.includeVideo ? 'Export' : 'Export WAV'}
+            </Button>
+          )}
           <Button size="icon" variant="subtle" disabled={!lastExport} onClick={copyLastExport} title="Copy exported file to clipboard">
             <Clipboard />
           </Button>
@@ -2035,6 +2101,10 @@ function MainApp() {
           <div className="viewer-toolbar">
             <span className="viewer-title">Viewer</span>
             <div className="viewer-toolbar-actions">
+              <Button size="sm" variant="subtle" disabled={!clip || isCopyingFrame} onClick={copyVideoFrame} title="Copy the current video frame to the clipboard at full source resolution, without crop or resize">
+                <Camera />
+                {isCopyingFrame ? 'Copying…' : 'Copy Frame'}
+              </Button>
               <div className="viewer-zoom-controls" aria-label="Viewer zoom controls">
                 <Button size="icon" variant="ghost" disabled={!viewerSourceSize} aria-label="Zoom out" title="Zoom Out (Ctrl+-)" onClick={() => zoomViewerBy(1 / 1.25)}>
                   <Minus />

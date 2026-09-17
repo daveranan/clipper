@@ -2,6 +2,10 @@
 
 QuickClipper is now a Tauri + React desktop clip editor. The old WPF app has been removed from the repo; the Tauri app at the repository root is the default build, release, and update target.
 
+In the viewer, **Copy Frame** pauses playback and copies the current frame to the clipboard as a full-resolution image from the source video. Viewer zoom, crop, and export size do not reduce the screenshot resolution.
+
+While exporting, **Stop Export** cancels the active job and removes its temporary files. It also works for WAV exports, size-cap retries, and encoder benchmarks; completed benchmark files remain available.
+
 ## Local development
 
 ```powershell

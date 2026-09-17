@@ -3197,6 +3197,7 @@ dependencies = [
  "arboard",
  "chrono",
  "dirs 6.0.0",
+ "image",
  "log",
  "rfd",
  "serde",
@@ -3210,6 +3211,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tempfile",
  "uuid",
  "windows 0.58.0",
 ]
